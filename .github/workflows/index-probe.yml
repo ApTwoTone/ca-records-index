@@ -1,0 +1,38 @@
+name: index-probe
+# STAGE 1 proof: confirm POST /lasearch (authoritative county index) works from
+# a GitHub-hosted Azure runner IP and is NOT Cloudflare-bot-walled. Calls 5
+# known doc#s incl 20260448794 (expect AFFIDAVIT / 2026-06-18).
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install curl_cffi
+        run: pip install --quiet curl_cffi
+      - name: probe /lasearch from runner IP
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          import la_county_index as idx
+          idx.THROTTLE = (0.0, 0.05)
+          DOCS = ["20260448794", "20260438605", "20260440000",
+                  "20260445000", "20260449202"]
+          walled = False
+          for d in DOCS:
+              r = idx.fetch(d, save_evidence=False)
+              print(json.dumps({
+                  "doc_no": r["doc_no"], "ok": r["ok"],
+                  "county_type": r.get("county_type"),
+                  "record_date": r.get("record_date"),
+                  "grantors": (r.get("grantors") or [])[:2],
+                  "reason": r.get("reason"),
+              }))
+              rsn = (r.get("reason") or "")
+              if "http_403" in rsn or "1010" in rsn or "non_json" in rsn:
+                  walled = True
+          print("WALLED" if walled else "CLEAR")
+          sys.exit(1 if walled else 0)
+          PY

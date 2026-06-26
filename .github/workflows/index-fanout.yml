@@ -1,0 +1,59 @@
+name: index-fanout
+# STAGE 2: distributed harvest of the LA recorder INDEX (POST /lasearch) across
+# N GitHub-hosted runners. Each runner = its own Azure IP = its own NETR per-IP
+# budget. Authoritative type + grantor/grantee names + AIN as tiny CSV text.
+# RESEARCH over PUBLIC records only.
+#
+# Run:
+#   gh workflow run index-fanout.yml -f doc_start=20260438605 -f doc_end=20260449202 -f shards=18
+on:
+  workflow_dispatch:
+    inputs:
+      doc_start: { required: true,  type: string }
+      doc_end:   { required: true,  type: string }
+      shards:    { required: true,  type: string, default: "18" }
+      conc:      { required: false, type: string, default: "6" }
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          python3 - "$DOC_START" "$DOC_END" "$SHARDS" <<'PY' >> "$GITHUB_OUTPUT"
+          import sys, json
+          s, e, n = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+          total = e - s + 1
+          per = -(-total // n)   # ceil
+          shards = [{"i": i, "start": s + i*per, "end": min(e, s + (i+1)*per - 1)}
+                    for i in range(n) if s + i*per <= e]
+          print("matrix=" + json.dumps({"include": shards}))
+          PY
+        env:
+          DOC_START: ${{ inputs.doc_start }}
+          DOC_END:   ${{ inputs.doc_end }}
+          SHARDS:    ${{ inputs.shards }}
+
+  harvest:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install curl_cffi
+        run: pip install --quiet curl_cffi
+      - name: harvest shard ${{ matrix.i }}  (${{ matrix.start }}..${{ matrix.end }})
+        run: |
+          mkdir -p out
+          python3 harvest_index_shard.py ${{ matrix.start }} ${{ matrix.end }} \
+            out/shard_${{ matrix.i }}.csv --conc ${{ inputs.conc }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: index-shard-${{ matrix.i }}
+          path: out/
+          retention-days: 3
