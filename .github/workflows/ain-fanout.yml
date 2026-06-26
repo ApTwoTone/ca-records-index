@@ -1,0 +1,72 @@
+name: ain-fanout
+# 10-YEAR BACKLOG: distributed AIN/parcel-history harvest (POST /lasearch ain=<APN>)
+# across N GitHub-hosted runners. Each runner = its own Azure IP = its own NETR
+# per-IP budget. One wave = a contiguous slice of remaining_ains.txt.gz, split
+# into `shards` line-ranges. Output = tiny raw CSVs (docs + scan) per shard.
+# Classification is deferred to the Spark merge (la_ain_harvest.classify).
+# RESEARCH over PUBLIC records only.
+#
+# Run one wave:
+#   gh workflow run ain-fanout.yml -f wave_offset=0 -f wave_size=132000 -f shards=20 -f conc=5
+on:
+  workflow_dispatch:
+    inputs:
+      wave_offset: { required: true,  type: string }                  # 0-based line offset into remaining_ains.txt
+      wave_size:   { required: false, type: string, default: "132000" }
+      shards:      { required: false, type: string, default: "20" }
+      conc:        { required: false, type: string, default: "5" }
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gen
+        run: |
+          gzip -dc remaining_ains.txt.gz | wc -l > /tmp/total_lines
+          python3 - "$WAVE_OFFSET" "$WAVE_SIZE" "$SHARDS" <<'PY' >> "$GITHUB_OUTPUT"
+          import sys, json
+          off, size, n = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+          total = int(open('/tmp/total_lines').read().strip())
+          wave_end = min(off + size, total)          # exclusive
+          span = max(0, wave_end - off)
+          per = -(-span // n) if span else 0          # ceil
+          shards = []
+          for i in range(n):
+              s = off + i * per
+              e = min(wave_end, off + (i + 1) * per)  # exclusive
+              if s < e:
+                  shards.append({"i": i, "start": s, "end": e})
+          print("matrix=" + json.dumps({"include": shards}))
+          PY
+        env:
+          WAVE_OFFSET: ${{ inputs.wave_offset }}
+          WAVE_SIZE:   ${{ inputs.wave_size }}
+          SHARDS:      ${{ inputs.shards }}
+
+  harvest:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20          # GitHub free concurrency cap == max distinct IPs
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install curl_cffi
+        run: pip install --quiet curl_cffi
+      - name: prepare ain list
+        run: gzip -dc remaining_ains.txt.gz > remaining_ains.txt
+      - name: harvest shard ${{ matrix.i }}  (lines ${{ matrix.start }}..${{ matrix.end }})
+        run: |
+          mkdir -p out
+          python3 harvest_ain_shard.py remaining_ains.txt \
+            ${{ matrix.start }} ${{ matrix.end }} \
+            out/shard_${{ matrix.i }} --conc ${{ inputs.conc }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ain-shard-${{ matrix.i }}
+          path: out/
+          retention-days: 3
