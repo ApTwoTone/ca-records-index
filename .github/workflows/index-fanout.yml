@@ -57,3 +57,5 @@ jobs:
           name: index-shard-${{ matrix.i }}
           path: out/
           retention-days: 3
+
+# trigger registration

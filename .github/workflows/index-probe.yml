@@ -36,3 +36,5 @@ jobs:
           print("WALLED" if walled else "CLEAR")
           sys.exit(1 if walled else 0)
           PY
+
+# trigger registration
