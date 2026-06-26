@@ -92,7 +92,7 @@ def search_ain_page(session, ain, page=1):
     return {"count": total, "rows": _parse_rows(rh), "capped": "only the most recent" in cnt}
 
 
-def harvest_ain(session, ain, spacing=0.0, max_wall_budget=30.0):
+def harvest_ain(session, ain, spacing=0.0, max_wall_budget=15.0):
     """Full parcel history (paginated) with shallow soft-throttle backoff.
     Returns (rows, status) where status in done/throttled_defer/error/empty."""
     page = 1
@@ -108,7 +108,7 @@ def harvest_ain(session, ain, spacing=0.0, max_wall_budget=30.0):
             return rows, "error:%s" % type(e).__name__
         if res.get("throttled"):
             throttle_hits += 1
-            if spent >= max_wall_budget or throttle_hits > 6:
+            if spent >= max_wall_budget or throttle_hits > 4:
                 return rows, "throttled_defer"
             s = min(delay + random.uniform(0, delay), max_wall_budget - spent)
             time.sleep(max(s, 0.2)); spent += s
@@ -133,6 +133,9 @@ def main():
     ap.add_argument("end_line", type=int)     # exclusive
     ap.add_argument("out_prefix")
     ap.add_argument("--conc", type=int, default=1)
+    ap.add_argument("--max-minutes", type=float, default=300.0,
+                    help="stop pulling new AINs past this wall-time so the runner "
+                         "self-limits well under GitHub's 6h job cap and still uploads")
     a = ap.parse_args()
 
     with open(a.ain_file, encoding="utf-8") as fh:
@@ -155,8 +158,12 @@ def main():
     sw.writerow(["ain", "doc_count", "status"])
     t0 = time.time()
 
+    deadline = t0 + a.max_minutes * 60.0
+
     def worker():
         while True:
+            if time.time() >= deadline:   # self-limit; unscanned AINs stay 'remaining'
+                return
             try:
                 ain = jobs.get_nowait()
             except queue.Empty:

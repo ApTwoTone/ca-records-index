@@ -49,6 +49,7 @@ jobs:
   harvest:
     needs: plan
     runs-on: ubuntu-latest
+    timeout-minutes: 345        # backstop under GitHub's hard 6h (360) job cap
     strategy:
       fail-fast: false
       max-parallel: 20          # GitHub free concurrency cap == max distinct IPs
@@ -64,8 +65,9 @@ jobs:
           mkdir -p out
           python3 harvest_ain_shard.py remaining_ains.txt \
             ${{ matrix.start }} ${{ matrix.end }} \
-            out/shard_${{ matrix.i }} --conc ${{ inputs.conc }}
+            out/shard_${{ matrix.i }} --conc ${{ inputs.conc }} --max-minutes 300
       - uses: actions/upload-artifact@v4
+        if: always()             # upload partial CSV even if the step is cut short
         with:
           name: ain-shard-${{ matrix.i }}
           path: out/
