@@ -7,9 +7,10 @@ name: thumb-leads
 on:
   workflow_dispatch:
     inputs:
-      pages:  { required: false, type: string, default: "3" }   # lead-sheet + body pages
-      shards: { required: false, type: string, default: "20" }
-      conc:   { required: false, type: string, default: "8" }
+      pages:  { required: false, type: string, default: "25" }  # walk until end-of-doc, capped for safety
+      shards: { required: false, type: string, default: "4" }
+      delay_min: { required: false, type: string, default: "5.0" }
+      delay_max: { required: false, type: string, default: "7.0" }
 
 jobs:
   plan:
@@ -44,38 +45,15 @@ jobs:
         env:
           NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
         run: |
-          echo "$NETR_PROXY_KEY" > /tmp/netr_proxy_key
+          test -n "$NETR_PROXY_KEY"
           mkdir -p out
-          python3 - "${{ matrix.docs }}" "${{ inputs.pages }}" "${{ inputs.conc }}" <<'PY'
-          import sys, os, urllib.request, ssl, threading, queue
-          docs=[d for d in sys.argv[1].split(",") if d]
-          pages=int(sys.argv[2]); conc=int(sys.argv[3])
-          KEY=open("/tmp/netr_proxy_key").read().strip()
-          W="https://netr-thumb.kaiescobar09.workers.dev"
-          CTX=ssl.create_default_context()
-          UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-          jobs=queue.Queue()
-          for d in docs:
-              for p in range(1,pages+1): jobs.put((d,p))
-          def work():
-              while True:
-                  try: d,p=jobs.get_nowait()
-                  except queue.Empty: return
-                  o="out/%s_%s.png"%(d,p)
-                  if not os.path.exists(o):
-                      try:
-                          req=urllib.request.Request("%s/thumb/%s/%s"%(W,d,p),headers={"X-Auth":KEY,"User-Agent":UA})
-                          with urllib.request.urlopen(req,timeout=45,context=CTX) as r:
-                              b=r.read()
-                              if b[:4]==b"\x89PNG" and len(b)>5000:
-                                  open(o,"wb").write(b)
-                      except Exception: pass
-                  jobs.task_done()
-          ts=[threading.Thread(target=work,daemon=True) for _ in range(conc)]
-          [t.start() for t in ts]; [t.join() for t in ts]
-          print("shard done: %d pngs"%len([f for f in os.listdir("out") if f.endswith('.png')]))
-          PY
+          tr ',' '\n' <<< "${{ matrix.docs }}" > doclist.txt
+          python3 pull_docs.py doclist.txt out \
+            --max-pages "${{ inputs.pages }}" \
+            --delay-min "${{ inputs.delay_min }}" \
+            --delay-max "${{ inputs.delay_max }}"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: thumb-leads-${{ matrix.i }}
           path: out/

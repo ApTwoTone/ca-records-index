@@ -92,7 +92,7 @@ def search_ain_page(session, ain, page=1):
     return {"count": total, "rows": _parse_rows(rh), "capped": "only the most recent" in cnt}
 
 
-def harvest_ain(session, ain, spacing=0.0, max_wall_budget=15.0):
+def harvest_ain(session, ain, spacing=0.0, max_wall_budget=15.0, max_pages=25):
     """Full parcel history (paginated) with shallow soft-throttle backoff.
     Returns (rows, status) where status in done/throttled_defer/error/empty."""
     page = 1
@@ -101,6 +101,7 @@ def harvest_ain(session, ain, spacing=0.0, max_wall_budget=15.0):
     spent = 0.0
     delay = 1.5
     throttle_hits = 0
+    page_cap_hit = False
     while True:
         try:
             res = search_ain_page(session, ain, page)
@@ -119,10 +120,15 @@ def harvest_ain(session, ain, spacing=0.0, max_wall_budget=15.0):
         rows += res["rows"]
         total = res.get("count")
         page += 1
-        if not res.get("capped") or len(rows) >= (total or 0) or page > 25:
+        if page > max_pages:
+            page_cap_hit = bool(res.get("capped")) and (total is None or len(rows) < total)
+            break
+        if not res.get("capped") or len(rows) >= (total or 0):
             break
         if spacing:
             time.sleep(random.uniform(spacing * 0.8, spacing * 1.2))
+    if page_cap_hit:
+        return rows, "page_cap_reached"
     return rows, ("done" if rows or total == 0 else "empty")
 
 
@@ -136,6 +142,8 @@ def main():
     ap.add_argument("--max-minutes", type=float, default=300.0,
                     help="stop pulling new AINs past this wall-time so the runner "
                          "self-limits well under GitHub's 6h job cap and still uploads")
+    ap.add_argument("--max-pages", type=int, default=25,
+                    help="maximum result pages to walk per AIN before marking page_cap_reached")
     a = ap.parse_args()
 
     with open(a.ain_file, encoding="utf-8") as fh:
@@ -153,12 +161,32 @@ def main():
     lock = threading.Lock()
     docs_fh = open(a.out_prefix + "_docs.csv", "w", newline="", encoding="utf-8")
     scan_fh = open(a.out_prefix + "_scan.csv", "w", newline="", encoding="utf-8")
+    progress_path = a.out_prefix + "_progress.json"
     dw = csv.writer(docs_fh); sw = csv.writer(scan_fh)
     dw.writerow(["ain", "doc_no", "record_date", "county_type", "grantors", "grantees"])
     sw.writerow(["ain", "doc_count", "status"])
     t0 = time.time()
 
     deadline = t0 + a.max_minutes * 60.0
+
+    def write_progress(extra=None):
+        payload = {
+            "generated_at": _now(),
+            "start_line": a.start_line,
+            "end_line": a.end_line,
+            "total_ains": total,
+            "processed_ains": sum(stats.values()),
+            "remaining_queue": jobs.qsize(),
+            "stats": dict(stats),
+            "deadline_utc": datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        if extra:
+            payload.update(extra)
+        try:
+            with open(progress_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+        except Exception:
+            pass
 
     def worker():
         while True:
@@ -169,7 +197,7 @@ def main():
             except queue.Empty:
                 return
             try:
-                rows, status = harvest_ain(session, ain)
+                rows, status = harvest_ain(session, ain, max_pages=a.max_pages)
             except Exception as e:
                 rows, status = [], "error:%s" % type(e).__name__
             with lock:
@@ -180,6 +208,8 @@ def main():
                 docs_fh.flush(); scan_fh.flush()
                 stats[status.split(":")[0]] += 1
                 done = sum(stats.values())
+                if done % 25 == 0 or done == total:
+                    write_progress()
                 if done % 200 == 0 or done == total:
                     el = time.time() - t0
                     print("%d/%d  %.0f ain/min  %s"
@@ -191,6 +221,21 @@ def main():
         t.start()
     for t in ts:
         t.join()
+    leftover = []
+    while True:
+        try:
+            leftover.append(jobs.get_nowait())
+            jobs.task_done()
+        except queue.Empty:
+            break
+    if leftover:
+        with lock:
+            for ain in leftover:
+                sw.writerow([ain, 0, "not_started_deadline"])
+            scan_fh.flush()
+            stats["not_started_deadline"] += len(leftover)
+            write_progress({"not_started_deadline": len(leftover)})
+            print("marked %d unscanned AINs as not_started_deadline" % len(leftover), flush=True)
     docs_fh.close(); scan_fh.close()
     el = time.time() - t0
     print("\nSHARD DONE %d AINs in %.1f min (%.0f ain/min) stats=%s"

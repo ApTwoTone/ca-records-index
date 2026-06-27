@@ -59,13 +59,28 @@ jobs:
       - name: install curl_cffi
         run: pip install --quiet curl_cffi
       - name: prepare ain list
-        run: gzip -dc remaining_ains.txt.gz > remaining_ains.txt
+        run: |
+          gzip -dc remaining_ains.txt.gz > remaining_ains.txt
+          mkdir -p out
+          PUBLIC_IP="$(curl -fsS https://api.ipify.org || true)"
+          cat > out/runner_identity_${{ matrix.i }}.json <<EOF
+          {
+            "workflow": "ain-fanout",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "shard": ${{ matrix.i }},
+            "start": ${{ matrix.start }},
+            "end": ${{ matrix.end }},
+            "runner_public_ip": "$PUBLIC_IP",
+            "conc": "${{ inputs.conc }}",
+            "started_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
       - name: harvest shard ${{ matrix.i }}  (lines ${{ matrix.start }}..${{ matrix.end }})
         run: |
-          mkdir -p out
           python3 harvest_ain_shard.py remaining_ains.txt \
             ${{ matrix.start }} ${{ matrix.end }} \
-            out/shard_${{ matrix.i }} --conc ${{ inputs.conc }} --max-minutes 300
+            out/shard_${{ matrix.i }} --conc ${{ inputs.conc }} --max-minutes 300 --max-pages 25
       - uses: actions/upload-artifact@v4
         if: always()             # upload partial CSV even if the step is cut short
         with:
