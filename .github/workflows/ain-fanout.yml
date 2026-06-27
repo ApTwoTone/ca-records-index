@@ -86,4 +86,7 @@ jobs:
         with:
           name: ain-shard-${{ matrix.i }}
           path: out/
-          retention-days: 3
+          retention-days: 30
+      - name: fail visibly if shard has deferred/error AINs
+        if: always()
+        run: python3 check_ain_shard_complete.py "out/shard_${{ matrix.i }}_scan.csv"

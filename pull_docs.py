@@ -10,7 +10,10 @@ The script is deliberately resumable:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import csv
+import datetime
+import json
 import os
 import random
 import ssl
@@ -23,6 +26,10 @@ from pathlib import Path
 WORKER = "https://netr-thumb.kaiescobar09.workers.dev"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 CTX = ssl.create_default_context()
+
+
+def now_utc() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def read_key() -> str:
@@ -105,9 +112,11 @@ def main() -> int:
     manifest_path = outdir / "pages_manifest.csv"
     failed_path = outdir / "failed_pages.csv"
     doc_status_path = outdir / "doc_status.csv"
+    summary_path = outdir / "pages_summary.json"
     manifest_exists = manifest_path.exists()
     failed_exists = failed_path.exists()
     status_exists = doc_status_path.exists()
+    doc_status_counts = Counter()
 
     with manifest_path.open("a", newline="", encoding="utf-8") as mf, \
             failed_path.open("a", newline="", encoding="utf-8") as ff, \
@@ -116,11 +125,11 @@ def main() -> int:
         fw = csv.writer(ff)
         sw = csv.writer(sf)
         if not manifest_exists:
-            mw.writerow(["doc_no", "page", "status", "upstream_status", "path", "bytes"])
+            mw.writerow(["doc_no", "page", "status", "upstream_status", "path", "bytes", "fetched_at_utc"])
         if not failed_exists:
-            fw.writerow(["doc_no", "page", "status", "upstream_status"])
+            fw.writerow(["doc_no", "page", "status", "upstream_status", "attempted_at_utc"])
         if not status_exists:
-            sw.writerow(["doc_no", "status", "pages_ok", "last_page_checked"])
+            sw.writerow(["doc_no", "status", "pages_ok", "last_page_checked", "finished_at_utc"])
 
         total_pages = 0
         failed_pages = 0
@@ -133,7 +142,7 @@ def main() -> int:
                 out = outdir / f"{doc_no}_{page}.png"
                 if is_valid_png(out):
                     size = out.stat().st_size
-                    mw.writerow([doc_no, page, "ok_existing", "", str(out.name), size])
+                    mw.writerow([doc_no, page, "ok_existing", "", str(out.name), size, now_utc()])
                     pages_ok += 1
                     total_pages += 1
                     continue
@@ -141,16 +150,16 @@ def main() -> int:
                 status, body, upstream = fetch_page(key, doc_no, page, args.attempts)
                 if status == "ok" and body:
                     out.write_bytes(body)
-                    mw.writerow([doc_no, page, "ok", upstream, str(out.name), len(body)])
+                    mw.writerow([doc_no, page, "ok", upstream, str(out.name), len(body), now_utc()])
                     pages_ok += 1
                     total_pages += 1
                 elif status == "end":
-                    mw.writerow([doc_no, page, "end", upstream, "", 0])
+                    mw.writerow([doc_no, page, "end", upstream, "", 0, now_utc()])
                     doc_status = "done"
                     break
                 else:
-                    mw.writerow([doc_no, page, status, upstream, "", 0])
-                    fw.writerow([doc_no, page, status, upstream])
+                    mw.writerow([doc_no, page, status, upstream, "", 0, now_utc()])
+                    fw.writerow([doc_no, page, status, upstream, now_utc()])
                     failed_pages += 1
 
                 mf.flush()
@@ -160,11 +169,33 @@ def main() -> int:
 
             if pages_ok == 0 and doc_status == "done":
                 doc_status = "no_pages"
-            sw.writerow([doc_no, doc_status, pages_ok, last_page])
+            if doc_status == "max_pages_reached":
+                fw.writerow([doc_no, last_page, doc_status, "", now_utc()])
+                failed_pages += 1
+            doc_status_counts[doc_status] += 1
+            sw.writerow([doc_no, doc_status, pages_ok, last_page, now_utc()])
             sf.flush()
             if i % 10 == 0 or i == len(docs):
                 print(f"pulled {i}/{len(docs)} docs, ok_pages={total_pages}, failed_pages={failed_pages}", flush=True)
 
+    summary_path.write_text(json.dumps({
+        "generated_at_utc": now_utc(),
+        "doclist": str(doclist),
+        "outdir": str(outdir),
+        "docs_requested": len(docs),
+        "ok_pages": total_pages,
+        "failed_pages": failed_pages,
+        "doc_status_counts": dict(doc_status_counts),
+        "max_pages": args.max_pages,
+        "attempts": args.attempts,
+        "delay_min": args.delay_min,
+        "delay_max": args.delay_max,
+        "outputs": {
+            "pages_manifest_csv": str(manifest_path),
+            "failed_pages_csv": str(failed_path),
+            "doc_status_csv": str(doc_status_path),
+        },
+    }, indent=2, sort_keys=True), encoding="utf-8")
     print(f"DONE docs={len(docs)} ok_pages={total_pages} failed_pages={failed_pages} -> {outdir}", flush=True)
     return 0
 

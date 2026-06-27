@@ -1,0 +1,116 @@
+name: ain-retry-failures
+# Backfill only the AINs that a previous ain-fanout run did not finish.
+# This downloads the source run artifacts, extracts status!=done rows from
+# *_scan.csv, shards that exact AIN list, and runs the normal AIN harvester.
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id: { required: true, type: string }
+      shards: { required: false, type: string, default: "20" }
+      conc: { required: false, type: string, default: "1" }
+      max_pages: { required: false, type: string, default: "25" }
+      max_minutes: { required: false, type: string, default: "300" }
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      retry_count: ${{ steps.gen.outputs.retry_count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: download source AIN artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p artifacts retry_lists
+          gh run download "${{ inputs.source_run_id }}" -R "${{ github.repository }}" -D artifacts
+      - id: gen
+        run: |
+          python3 - "${{ inputs.shards }}" <<'PY' >> "$GITHUB_OUTPUT"
+          import csv, glob, json, sys
+          shards = max(1, int(sys.argv[1]))
+          retry = []
+          seen = set()
+          for path in sorted(glob.glob("artifacts/**/*_scan.csv", recursive=True)):
+              with open(path, newline="", encoding="utf-8") as fh:
+                  for row in csv.DictReader(fh):
+                      ain = (row.get("ain") or "").strip()
+                      status = (row.get("status") or "").strip()
+                      if not ain or status == "done" or ain in seen:
+                          continue
+                      seen.add(ain)
+                      retry.append(ain)
+          retry = sorted(retry, key=lambda v: int(v) if v.isdigit() else v)
+          per = -(-len(retry) // shards) if retry else 1
+          include = []
+          for i in range(shards):
+              chunk = retry[i * per:(i + 1) * per]
+              if not chunk:
+                  continue
+              path = f"retry_lists/retry_ains_{i}.txt"
+              with open(path, "w", encoding="utf-8") as fh:
+                  fh.write("\n".join(chunk) + "\n")
+              include.append({"i": i, "count": len(chunk)})
+          print("matrix=" + json.dumps({"include": include}))
+          print("retry_count=" + str(len(retry)))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: retry-ain-lists-${{ inputs.source_run_id }}
+          path: retry_lists/
+          retention-days: 30
+
+  harvest:
+    needs: plan
+    if: ${{ needs.plan.outputs.retry_count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: retry-ain-lists-${{ inputs.source_run_id }}
+          path: retry_lists
+      - name: install curl_cffi
+        run: pip install --quiet curl_cffi
+      - name: prepare runner identity
+        run: |
+          mkdir -p out
+          PUBLIC_IP="$(curl -fsS https://api.ipify.org || true)"
+          cat > out/runner_identity_${{ matrix.i }}.json <<EOF
+          {
+            "workflow": "ain-retry-failures",
+            "source_run_id": "${{ inputs.source_run_id }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "shard": ${{ matrix.i }},
+            "ain_count": ${{ matrix.count }},
+            "runner_public_ip": "$PUBLIC_IP",
+            "conc": "${{ inputs.conc }}",
+            "started_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+      - name: harvest retry shard ${{ matrix.i }} (${{ matrix.count }} AINs)
+        run: |
+          python3 harvest_ain_shard.py "retry_lists/retry_ains_${{ matrix.i }}.txt" \
+            0 ${{ matrix.count }} \
+            out/retry_shard_${{ matrix.i }} --conc ${{ inputs.conc }} \
+            --max-minutes "${{ inputs.max_minutes }}" --max-pages "${{ inputs.max_pages }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ain-retry-${{ inputs.source_run_id }}-${{ matrix.i }}
+          path: out/
+          retention-days: 30
+      - name: fail visibly if retry shard still has deferred/error AINs
+        if: always()
+        run: python3 check_ain_shard_complete.py "out/retry_shard_${{ matrix.i }}_scan.csv"
