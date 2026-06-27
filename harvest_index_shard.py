@@ -26,7 +26,14 @@ import lead_class as lc
 # so la_county_index parses it as parse_no_row and does NOT retry. We detect
 # that here and re-issue with backoff. Keep a small inter-call floor so a single
 # worker rides the ~0.3 req/s refill instead of blowing the ~20 burst instantly.
-idx.THROTTLE = (0.55, 0.85)   # per-worker floor; ride the ~0.3/s refill, light on burst
+# Measured 2026-06-27: conc=6 + (0.55,0.85) floor SATURATES NETR's ~20 req/min
+# per-IP limit -> ~44% of REAL docs come back as the soft "Too many searches"
+# wall and the shallow budget drops them. Pace one serial worker at ~3s (≈18/min,
+# just under the limit) for a clean ~100% capture. Env-tunable for future runs.
+idx.THROTTLE = (
+    float(os.environ.get("NETR_THROTTLE_MIN", "2.8")),
+    float(os.environ.get("NETR_THROTTLE_MAX", "3.4")),
+)
 idx.RETRIES = 3
 
 THROTTLE_MARKERS = ("too many searches", "please wait a moment")
@@ -38,7 +45,7 @@ def _is_throttled(res):
     return any(m in rsn or m in ct for m in THROTTLE_MARKERS)
 
 
-def fetch_resilient(doc, max_wall_retries=4, max_wall_budget=18.0):
+def fetch_resilient(doc, max_wall_retries=6, max_wall_budget=40.0):
     """idx.fetch + detection of the soft 'Too many searches' rate-wall (HTTP 200
     body). SHALLOW backoff: cap total per-doc backoff so one persistently-walled
     doc can't stall the whole shard (the 9-deep version did exactly that)."""
