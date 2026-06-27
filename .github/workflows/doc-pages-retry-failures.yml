@@ -1,18 +1,14 @@
-name: ain-doc-pages
-# Pull page images for every document discovered by a completed ain-fanout run.
-# The plan job downloads the AIN run artifacts, extracts unique doc_no values
-# from *_docs.csv, writes per-shard doc lists, and the pull jobs fetch pages
-# through pull_docs.py with resumable manifests and failed_pages.csv output.
+name: doc-pages-retry-failures
+# Backfill documents whose prior page pull had failed pages or hit max_pages.
 on:
   workflow_dispatch:
     inputs:
-      ain_run_id: { required: true, type: string }
+      source_page_run_id: { required: true, type: string }
       pages: { required: false, type: string, default: "25" }
       shards: { required: false, type: string, default: "4" }
       delay_min: { required: false, type: string, default: "5.0" }
       delay_max: { required: false, type: string, default: "7.0" }
       attempts: { required: false, type: string, default: "6" }
-      max_docs: { required: false, type: string, default: "0" }
 
 permissions:
   actions: read
@@ -26,75 +22,56 @@ jobs:
       doc_count: ${{ steps.gen.outputs.doc_count }}
     steps:
       - uses: actions/checkout@v4
-      - name: download AIN artifacts
+      - name: download prior page artifacts
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p artifacts doclists
-          gh run download "${{ inputs.ain_run_id }}" -R "${{ github.repository }}" -D artifacts
+          gh run download "${{ inputs.source_page_run_id }}" -R "${{ github.repository }}" -D artifacts
       - id: gen
         run: |
-          python3 - "${{ inputs.shards }}" "${{ inputs.max_docs }}" <<'PY' >> "$GITHUB_OUTPUT"
-          import csv, glob, json, os, sys
+          python3 - "${{ inputs.shards }}" <<'PY' >> "$GITHUB_OUTPUT"
+          import csv, glob, json, sys
+          complete = {"done", "no_pages"}
           shards = max(1, int(sys.argv[1]))
-          max_docs = int(sys.argv[2])
           docs = []
           seen = set()
-          meta = {}
-          def add_meta(doc, row):
-              rec = meta.setdefault(doc, {
-                  "doc_no": doc, "ain": set(), "record_date": set(),
-                  "county_type": set(), "grantors": set(), "grantees": set(),
-                  "lead_class": set(),
-              })
-              for key in ("ain", "record_date", "county_type", "lead_class"):
-                  val = (row.get(key) or "").strip()
-                  if val:
-                      rec[key].add(val)
-              for key in ("grantors", "grantees"):
-                  raw = (row.get(key) or "").strip()
-                  if not raw:
-                      continue
-                  try:
-                      parsed = json.loads(raw)
-                      vals = parsed if isinstance(parsed, list) else [raw]
-                  except Exception:
-                      vals = [v.strip() for v in raw.replace("|", ";").split(";")]
-                  for val in vals:
-                      val = str(val).strip()
-                      if val:
-                          rec[key].add(val)
-          for path in sorted(glob.glob("artifacts/**/*_docs.csv", recursive=True)):
+          for path in sorted(glob.glob("artifacts/**/failed_pages.csv", recursive=True)):
               with open(path, newline="", encoding="utf-8") as fh:
                   for row in csv.DictReader(fh):
                       doc = (row.get("doc_no") or "").strip()
-                      if not doc or doc in seen:
-                          if doc:
-                              add_meta(doc, row)
-                          continue
-                      add_meta(doc, row)
-                      seen.add(doc)
-                      docs.append(doc)
+                      if doc and doc not in seen:
+                          seen.add(doc)
+                          docs.append(doc)
+          for path in sorted(glob.glob("artifacts/**/doc_status.csv", recursive=True)):
+              with open(path, newline="", encoding="utf-8") as fh:
+                  for row in csv.DictReader(fh):
+                      doc = (row.get("doc_no") or "").strip()
+                      status = (row.get("status") or "").strip()
+                      if doc and status not in complete and doc not in seen:
+                          seen.add(doc)
+                          docs.append(doc)
           docs = sorted(docs, key=lambda d: int(d) if d.isdigit() else d)
-          if max_docs > 0:
-              docs = docs[:max_docs]
           with open("doclists/doc_metadata.csv", "w", newline="", encoding="utf-8") as fh:
-              fields = ["doc_no", "ain", "record_date", "county_type", "grantors", "grantees", "lead_class"]
-              writer = csv.DictWriter(fh, fieldnames=fields)
+              writer = csv.DictWriter(fh, fieldnames=["doc_no", "ain", "record_date", "county_type", "grantors", "grantees", "lead_class"])
               writer.writeheader()
               for doc in docs:
-                  rec = meta.get(doc, {"doc_no": doc})
-                  out = {"doc_no": doc}
-                  for key in fields[1:]:
-                      out[key] = json.dumps(sorted(rec.get(key, set())))
-                  writer.writerow(out)
+                  writer.writerow({
+                      "doc_no": doc,
+                      "ain": "[]",
+                      "record_date": "[]",
+                      "county_type": "[]",
+                      "grantors": "[]",
+                      "grantees": "[]",
+                      "lead_class": "[]",
+                  })
           per = -(-len(docs) // shards) if docs else 1
           include = []
           for i in range(shards):
               chunk = docs[i * per:(i + 1) * per]
               if not chunk:
                   continue
-              path = f"doclists/doclist_{i}.txt"
+              path = f"doclists/retry_doclist_{i}.txt"
               with open(path, "w", encoding="utf-8") as fh:
                   fh.write("\n".join(chunk) + "\n")
               include.append({"i": i, "count": len(chunk)})
@@ -103,7 +80,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: doc-page-lists-${{ inputs.ain_run_id }}
+          name: retry-doc-page-lists-${{ inputs.source_page_run_id }}
           path: doclists/
           retention-days: 30
 
@@ -123,15 +100,15 @@ jobs:
           sudo apt-get install -y tesseract-ocr
       - uses: actions/download-artifact@v4
         with:
-          name: doc-page-lists-${{ inputs.ain_run_id }}
+          name: retry-doc-page-lists-${{ inputs.source_page_run_id }}
           path: doclists
-      - name: pull pages for shard ${{ matrix.i }}
+      - name: pull retry pages for shard ${{ matrix.i }}
         env:
           NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
         run: |
           test -n "$NETR_PROXY_KEY"
           mkdir -p out
-          python3 pull_docs.py "doclists/doclist_${{ matrix.i }}.txt" out \
+          python3 pull_docs.py "doclists/retry_doclist_${{ matrix.i }}.txt" out \
             --max-pages "${{ inputs.pages }}" \
             --attempts "${{ inputs.attempts }}" \
             --delay-min "${{ inputs.delay_min }}" \
@@ -144,10 +121,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: doc-pages-${{ inputs.ain_run_id }}-${{ matrix.i }}
+          name: doc-pages-retry-${{ inputs.source_page_run_id }}-${{ matrix.i }}
           path: out/
           retention-days: 30
-      - name: fail visibly if pages are missing or capped
+      - name: fail visibly if retry pages are still missing or capped
         if: always()
         run: python3 check_doc_pages_complete.py out
       - name: fail visibly if deed OCR/intelligence is blank

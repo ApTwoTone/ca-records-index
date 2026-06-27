@@ -11,9 +11,11 @@
 # Runs on a GitHub-hosted runner (its own Azure IP = its own NETR per-IP budget).
 # Output is RAW: classification (canonical_type/is_target/is_neg_trap) is
 # deferred to the Spark-side merge (la_ain_harvest.classify) so the taxonomy
-# never forks. Two small CSVs per shard:
+# never forks. Two small CSVs per shard, plus sidecar proof/retry files:
 #   <prefix>_docs.csv : ain,doc_no,record_date,county_type,grantors,grantees
 #   <prefix>_scan.csv : ain,doc_count,status            (done/throttled_defer/error/empty)
+#   <prefix>_retry_ains.csv/txt : non-done AINs for backfill
+#   <prefix>_summary.json : exact status counts, parse warnings, artifact contract
 #
 # Usage:
 #   python3 harvest_ain_shard.py <ain_list_file> <start_line> <end_line> <out_prefix> [--conc 5]
@@ -45,9 +47,11 @@ def _now():
 def _parse_rows(results_html):
     """All rows for the parcel: (doc_no, record_date, county_type, grantors[], grantees[])."""
     out = []
+    skipped = 0
     for m in idx._ROW_RE.finditer(results_html or ""):
         cells = idx._CELL_RE.findall(m.group(1))
         if len(cells) < 5:
+            skipped += 1
             continue
         doc = idx._clean(cells[0])
         dm = idx._DATE_RE.search(idx._clean(cells[1]))
@@ -56,7 +60,7 @@ def _parse_rows(results_html):
         gtor = idx._split_names(cells[3])
         gtee = idx._split_names(cells[4])
         out.append((doc, rec, ctype, gtor, gtee))
-    return out
+    return out, skipped
 
 
 def search_ain_page(session, ain, page=1):
@@ -89,15 +93,17 @@ def search_ain_page(session, ain, page=1):
         return {"count": 0, "rows": []}
     mtot = re.search(r"([\d,]+)\s+document", cnt)
     total = int(mtot.group(1).replace(",", "")) if mtot else None
-    return {"count": total, "rows": _parse_rows(rh), "capped": "only the most recent" in cnt}
+    rows, parse_skipped = _parse_rows(rh)
+    return {"count": total, "rows": rows, "capped": "only the most recent" in cnt, "parse_skipped": parse_skipped}
 
 
 def harvest_ain(session, ain, spacing=0.0, max_wall_budget=15.0, max_pages=25):
     """Full parcel history (paginated) with shallow soft-throttle backoff.
-    Returns (rows, status) where status in done/throttled_defer/error/empty."""
+    Returns (rows, status, parse_skipped_rows) where status in done/throttled_defer/error/empty."""
     page = 1
     rows = []
     total = None
+    parse_skipped = 0
     spent = 0.0
     delay = 1.5
     throttle_hits = 0
@@ -106,18 +112,19 @@ def harvest_ain(session, ain, spacing=0.0, max_wall_budget=15.0, max_pages=25):
         try:
             res = search_ain_page(session, ain, page)
         except Exception as e:
-            return rows, "error:%s" % type(e).__name__
+            return rows, "error:%s" % type(e).__name__, parse_skipped
         if res.get("throttled"):
             throttle_hits += 1
             if spent >= max_wall_budget or throttle_hits > 4:
-                return rows, "throttled_defer"
+                return rows, "throttled_defer", parse_skipped
             s = min(delay + random.uniform(0, delay), max_wall_budget - spent)
             time.sleep(max(s, 0.2)); spent += s
             delay = min(delay * 1.6, 8.0)
             continue
         if res.get("err"):
-            return rows, "error:%s" % res["err"]
+            return rows, "error:%s" % res["err"], parse_skipped
         rows += res["rows"]
+        parse_skipped += int(res.get("parse_skipped") or 0)
         total = res.get("count")
         page += 1
         if page > max_pages:
@@ -128,8 +135,8 @@ def harvest_ain(session, ain, spacing=0.0, max_wall_budget=15.0, max_pages=25):
         if spacing:
             time.sleep(random.uniform(spacing * 0.8, spacing * 1.2))
     if page_cap_hit:
-        return rows, "page_cap_reached"
-    return rows, ("done" if rows or total == 0 else "empty")
+        return rows, "page_cap_reached", parse_skipped
+    return rows, ("done" if rows or total == 0 else "empty"), parse_skipped
 
 
 def main():
@@ -158,6 +165,10 @@ def main():
     for x in ains:
         jobs.put(x)
     stats = collections.Counter()
+    status_counts = collections.Counter()
+    retry_rows = []
+    parse_issue_rows = []
+    docs_rows_written = 0
     lock = threading.Lock()
     docs_fh = open(a.out_prefix + "_docs.csv", "w", newline="", encoding="utf-8")
     scan_fh = open(a.out_prefix + "_scan.csv", "w", newline="", encoding="utf-8")
@@ -178,6 +189,7 @@ def main():
             "processed_ains": sum(stats.values()),
             "remaining_queue": jobs.qsize(),
             "stats": dict(stats),
+            "status_counts": dict(status_counts),
             "deadline_utc": datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         if extra:
@@ -189,6 +201,7 @@ def main():
             pass
 
     def worker():
+        nonlocal docs_rows_written
         while True:
             if time.time() >= deadline:   # self-limit; unscanned AINs stay 'remaining'
                 return
@@ -197,16 +210,34 @@ def main():
             except queue.Empty:
                 return
             try:
-                rows, status = harvest_ain(session, ain, max_pages=a.max_pages)
+                rows, status, parse_skipped = harvest_ain(session, ain, max_pages=a.max_pages)
             except Exception as e:
-                rows, status = [], "error:%s" % type(e).__name__
+                rows, status, parse_skipped = [], "error:%s" % type(e).__name__, 0
             with lock:
                 for (doc, rec, ctype, gtor, gtee) in rows:
                     dw.writerow([ain, doc, rec or "", ctype or "",
                                  json.dumps(gtor), json.dumps(gtee)])
+                docs_rows_written += len(rows)
                 sw.writerow([ain, len(rows), status])
                 docs_fh.flush(); scan_fh.flush()
                 stats[status.split(":")[0]] += 1
+                status_counts[status] += 1
+                if status != "done":
+                    retry_rows.append({
+                        "ain": ain,
+                        "doc_count": len(rows),
+                        "status": status,
+                        "shard_start_line": a.start_line,
+                        "shard_end_line": a.end_line,
+                        "finished_at_utc": _now(),
+                    })
+                if parse_skipped:
+                    parse_issue_rows.append({
+                        "ain": ain,
+                        "issue": "malformed_result_rows_skipped",
+                        "count": parse_skipped,
+                        "finished_at_utc": _now(),
+                    })
                 done = sum(stats.values())
                 if done % 25 == 0 or done == total:
                     write_progress()
@@ -232,11 +263,67 @@ def main():
         with lock:
             for ain in leftover:
                 sw.writerow([ain, 0, "not_started_deadline"])
+                retry_rows.append({
+                    "ain": ain,
+                    "doc_count": 0,
+                    "status": "not_started_deadline",
+                    "shard_start_line": a.start_line,
+                    "shard_end_line": a.end_line,
+                    "finished_at_utc": _now(),
+                })
             scan_fh.flush()
             stats["not_started_deadline"] += len(leftover)
+            status_counts["not_started_deadline"] += len(leftover)
             write_progress({"not_started_deadline": len(leftover)})
             print("marked %d unscanned AINs as not_started_deadline" % len(leftover), flush=True)
     docs_fh.close(); scan_fh.close()
+
+    retry_csv = a.out_prefix + "_retry_ains.csv"
+    retry_txt = a.out_prefix + "_retry_ains.txt"
+    parse_issues_csv = a.out_prefix + "_parse_issues.csv"
+    summary_json = a.out_prefix + "_summary.json"
+
+    with open(retry_csv, "w", newline="", encoding="utf-8") as fh:
+        fields = ["ain", "doc_count", "status", "shard_start_line", "shard_end_line", "finished_at_utc"]
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for row in retry_rows:
+            writer.writerow(row)
+    with open(retry_txt, "w", encoding="utf-8") as fh:
+        for row in retry_rows:
+            fh.write(str(row["ain"]) + "\n")
+    with open(parse_issues_csv, "w", newline="", encoding="utf-8") as fh:
+        fields = ["ain", "issue", "count", "finished_at_utc"]
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for row in parse_issue_rows:
+            writer.writerow(row)
+    with open(summary_json, "w", encoding="utf-8") as fh:
+        json.dump({
+            "generated_at_utc": _now(),
+            "start_line": a.start_line,
+            "end_line": a.end_line,
+            "total_ains": total,
+            "processed_ains": sum(stats.values()),
+            "docs_rows_written": docs_rows_written,
+            "status_groups": dict(stats),
+            "status_counts": dict(status_counts),
+            "unfinished_ains": len(retry_rows),
+            "parse_issue_ains": len(parse_issue_rows),
+            "parse_skipped_rows": sum(int(row["count"]) for row in parse_issue_rows),
+            "max_pages": a.max_pages,
+            "max_minutes": a.max_minutes,
+            "artifact_contract": {
+                "docs_csv": ["ain", "doc_no", "record_date", "county_type", "grantors", "grantees"],
+                "scan_csv": ["ain", "doc_count", "status"],
+                "retry_ains_csv": ["ain", "doc_count", "status", "shard_start_line", "shard_end_line", "finished_at_utc"],
+                "parse_issues_csv": ["ain", "issue", "count", "finished_at_utc"],
+                "not_collected_by_ain_index": ["mailing_address", "phone_numbers", "document_page_images", "assembled_pdf"],
+            },
+            "retry_csv": os.path.basename(retry_csv),
+            "retry_txt": os.path.basename(retry_txt),
+            "parse_issues_csv": os.path.basename(parse_issues_csv),
+        }, fh, indent=2, sort_keys=True)
     el = time.time() - t0
     print("\nSHARD DONE %d AINs in %.1f min (%.0f ain/min) stats=%s"
           % (total, el / 60, total / el * 60 if el else 0, dict(stats)), flush=True)
