@@ -1,0 +1,193 @@
+name: doc-pages-explicit
+# Pull and OCR an explicit doc# list for pattern probes found from the AIN index.
+# Use this for small canaries such as foreign-entity/corporate-grantee candidates:
+# it preserves raw OCR text, emits deed intelligence sidecars, and fails visibly
+# on missing/capped pages instead of silently treating blank previews as absent.
+on:
+  workflow_dispatch:
+    inputs:
+      doc_nos:
+        required: true
+        type: string
+        description: "Comma/newline/space separated NETR doc numbers"
+      source_ain_run_id:
+        required: false
+        type: string
+        default: ""
+        description: "Optional ain-fanout run id to hydrate AIN/grantor/grantee metadata"
+      pages: { required: false, type: string, default: "25" }
+      shards: { required: false, type: string, default: "1" }
+      delay_min: { required: false, type: string, default: "8.0" }
+      delay_max: { required: false, type: string, default: "12.0" }
+      attempts: { required: false, type: string, default: "8" }
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      doc_count: ${{ steps.gen.outputs.doc_count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install curl_cffi for metadata fallback
+        run: pip install --quiet curl_cffi
+      - name: download source AIN artifacts
+        if: ${{ inputs.source_ain_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p artifacts
+          gh run download "${{ inputs.source_ain_run_id }}" -R "${{ github.repository }}" -D artifacts
+      - id: gen
+        env:
+          DOC_NOS: ${{ inputs.doc_nos }}
+        run: |
+          mkdir -p doclists
+          python3 - "${{ inputs.shards }}" <<'PY' >> "$GITHUB_OUTPUT"
+          import csv, glob, json, os, re, sys
+          import la_county_index as idx
+
+          shards = max(1, int(sys.argv[1]))
+          raw_docs = os.environ.get("DOC_NOS", "")
+          docs = []
+          seen = set()
+          for doc in re.split(r"[\s,]+", raw_docs.strip()):
+              doc = doc.strip()
+              if doc and doc not in seen:
+                  seen.add(doc)
+                  docs.append(doc)
+
+          meta = {}
+
+          def add_meta(doc, row):
+              rec = meta.setdefault(doc, {
+                  "doc_no": doc, "ain": set(), "record_date": set(),
+                  "county_type": set(), "grantors": set(), "grantees": set(),
+                  "lead_class": set(),
+              })
+              for key in ("ain", "record_date", "county_type", "lead_class"):
+                  val = (row.get(key) or "").strip()
+                  if val:
+                      rec[key].add(val)
+              for key in ("grantors", "grantees"):
+                  raw = (row.get(key) or "").strip()
+                  if not raw:
+                      continue
+                  try:
+                      parsed = json.loads(raw)
+                      vals = parsed if isinstance(parsed, list) else [raw]
+                  except Exception:
+                      vals = [v.strip() for v in raw.replace("|", ";").split(";")]
+                  for val in vals:
+                      val = str(val).strip()
+                      if val:
+                          rec[key].add(val)
+
+          wanted = set(docs)
+          for path in sorted(glob.glob("artifacts/**/*_docs.csv", recursive=True)):
+              with open(path, newline="", encoding="utf-8") as fh:
+                  for row in csv.DictReader(fh):
+                      doc = (row.get("doc_no") or "").strip()
+                      if doc in wanted:
+                          add_meta(doc, row)
+
+          missing = [doc for doc in docs if doc not in meta]
+          if missing:
+              idx.THROTTLE = (3.0, 5.0)
+              idx.RETRIES = 4
+          for doc in missing:
+              try:
+                  res = idx.fetch(doc, save_evidence=False)
+              except Exception as exc:
+                  res = {"ok": False, "reason": f"{type(exc).__name__}:{exc}"}
+              row = {
+                  "doc_no": doc,
+                  "ain": res.get("ain") or "",
+                  "record_date": res.get("record_date") or "",
+                  "county_type": res.get("county_type") or "",
+                  "grantors": json.dumps(res.get("grantors") or []),
+                  "grantees": json.dumps(res.get("grantees") or []),
+                  "lead_class": "",
+              }
+              add_meta(doc, row)
+
+          with open("doclists/doc_metadata.csv", "w", newline="", encoding="utf-8") as fh:
+              fields = ["doc_no", "ain", "record_date", "county_type", "grantors", "grantees", "lead_class"]
+              writer = csv.DictWriter(fh, fieldnames=fields)
+              writer.writeheader()
+              for doc in docs:
+                  rec = meta.get(doc, {"doc_no": doc})
+                  out = {"doc_no": doc}
+                  for key in fields[1:]:
+                      out[key] = json.dumps(sorted(rec.get(key, set())))
+                  writer.writerow(out)
+
+          per = -(-len(docs) // shards) if docs else 1
+          include = []
+          for i in range(shards):
+              chunk = docs[i * per:(i + 1) * per]
+              if not chunk:
+                  continue
+              path = f"doclists/explicit_doclist_{i}.txt"
+              with open(path, "w", encoding="utf-8") as fh:
+                  fh.write("\n".join(chunk) + "\n")
+              include.append({"i": i, "count": len(chunk)})
+          print("matrix=" + json.dumps({"include": include}))
+          print("doc_count=" + str(len(docs)))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: explicit-doc-page-lists-${{ github.run_id }}
+          path: doclists/
+          retention-days: 30
+
+  pull:
+    needs: plan
+    if: ${{ needs.plan.outputs.doc_count != '0' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install OCR engine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
+      - uses: actions/download-artifact@v4
+        with:
+          name: explicit-doc-page-lists-${{ github.run_id }}
+          path: doclists
+      - name: pull explicit pages for shard ${{ matrix.i }}
+        env:
+          NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
+        run: |
+          test -n "$NETR_PROXY_KEY"
+          mkdir -p out
+          python3 pull_docs.py "doclists/explicit_doclist_${{ matrix.i }}.txt" out \
+            --max-pages "${{ inputs.pages }}" \
+            --attempts "${{ inputs.attempts }}" \
+            --delay-min "${{ inputs.delay_min }}" \
+            --delay-max "${{ inputs.delay_max }}"
+      - name: extract deed-body buyer/seller intelligence
+        if: always()
+        run: |
+          mkdir -p out/deed_intel
+          python3 deed_body_intelligence.py out doclists/doc_metadata.csv out/deed_intel
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: doc-pages-explicit-${{ github.run_id }}-${{ matrix.i }}
+          path: out/
+          retention-days: 30
+      - name: fail visibly if pages are missing or capped
+        if: always()
+        run: python3 check_doc_pages_complete.py out
+      - name: fail visibly if deed OCR/intelligence is blank
+        if: always()
+        run: python3 check_deed_intelligence_complete.py out/deed_intel

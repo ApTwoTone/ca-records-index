@@ -133,6 +133,19 @@ TRANSFER_TAX_RE = re.compile(
 )
 COMPANY_NO_RE = re.compile(r"\b(?:COMPANY|REGISTRATION|ENTITY|FILE)\s+(?:NO|NUMBER|#)\.?\s*[:#]?\s*([A-Z0-9\-]{3,30})\b", re.I)
 OCR_CONFIDENCE_PREFIX_RE = re.compile(r"(?m)^\s*(?:0|1)(?:\.\d{1,3})?\s+")
+PHONE_LIKE_RE = re.compile(
+    r"(?<!\d)(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]?\d{4}(?!\d)"
+)
+EMAIL_LIKE_RE = re.compile(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", re.I)
+DOC_DATE_LINE_RE = re.compile(
+    r"\b(?:DATED|DATE|EXECUTED|ACKNOWLEDGED|SUBSCRIBED|NOTARY|RECORDED|FILED)\b",
+    re.I,
+)
+DATE_VALUE_RE = re.compile(
+    r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|"
+    r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\.?\s+\d{1,2},?\s+\d{2,4})\b",
+    re.I,
+)
 
 
 def now_utc() -> str:
@@ -316,6 +329,14 @@ def extract_entity_domiciles(text: str) -> list[dict[str, str]]:
 
 
 def extract_block(lines: list[str], starts: tuple[str, ...], max_lines: int = 12) -> str:
+    blocks = extract_blocks(lines, starts, max_lines=max_lines)
+    for block in blocks:
+        if country_from_block(block)[1]:
+            return block
+    return blocks[0] if blocks else ""
+
+
+def extract_blocks(lines: list[str], starts: tuple[str, ...], max_lines: int = 12) -> list[str]:
     starts_upper = tuple(s.upper() for s in starts)
     blocks = []
     for i, line in enumerate(lines):
@@ -328,14 +349,18 @@ def extract_block(lines: list[str], starts: tuple[str, ...], max_lines: int = 12
                     if len(block) > 1:
                         break
                     continue
-                if re.search(r"^(SPACE ABOVE|DOCUMENTARY|THIS CONVEYANCE|GRANTOR|GRANTEE|EXHIBIT|LEGAL DESCRIPTION)\b", clean, re.I):
+                if re.search(
+                    r"^(SPACE ABOVE|DOCUMENTARY|THIS CONVEYANCE|GRANTOR|GRANTEE|"
+                    r"EXHIBIT|LEGAL DESCRIPTION|WHEN RECORDED|MAIL TAX|RETURN TO|"
+                    r"PREPARED BY|TRUST TRANSFER|GRANT DEED|DEED OF TRUST|QUITCLAIM|"
+                    r"DATED|DATE|APN|A\.P\.N)\b",
+                    clean,
+                    re.I,
+                ):
                     break
                 block.append(clean)
             blocks.append(" | ".join(clean_ws(x) for x in block if clean_ws(x)))
-    for block in blocks:
-        if country_from_block(block)[1]:
-            return block
-    return blocks[0] if blocks else ""
+    return list(dict.fromkeys(blocks))
 
 
 def country_from_block(block: str) -> tuple[str, bool]:
@@ -385,6 +410,86 @@ def extract_company_numbers(text: str) -> list[str]:
     return list(dict.fromkeys(clean_ws(m.group(1)) for m in COMPANY_NO_RE.finditer(text or "")))
 
 
+def redact_phone_like(value: str) -> str:
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) < 7:
+        return "***"
+    return "***-***-" + digits[-4:]
+
+
+def redact_email_like(value: str) -> str:
+    value = value or ""
+    if "@" not in value:
+        return "***"
+    user, domain = value.split("@", 1)
+    return (user[:1] or "*") + "***@" + domain.lower()
+
+
+def redact_contact_line(line: str) -> str:
+    out = PHONE_LIKE_RE.sub(lambda m: redact_phone_like(m.group(0)), line or "")
+    out = EMAIL_LIKE_RE.sub(lambda m: redact_email_like(m.group(0)), out)
+    return clean_ws(out)
+
+
+def is_probable_non_contact_number(line: str, value: str) -> bool:
+    digits = re.sub(r"\D", "", value or "")
+    upper = upper_blob(line)
+    if len(digits) != 10:
+        return True
+    if re.search(r"\b(APN|AIN|PARCEL|DOCUMENT|INSTRUMENT|TAX)\b", upper):
+        return True
+    return False
+
+
+def extract_contact_like_signals(lines: list[str]) -> dict[str, object]:
+    phone_values = []
+    phone_contexts = []
+    email_values = []
+    email_contexts = []
+    for line in lines:
+        for match in PHONE_LIKE_RE.finditer(line):
+            raw = match.group(0)
+            if is_probable_non_contact_number(line, raw):
+                continue
+            phone_values.append(redact_phone_like(raw))
+            phone_contexts.append(redact_contact_line(line))
+        for match in EMAIL_LIKE_RE.finditer(line):
+            raw = match.group(0)
+            email_values.append(redact_email_like(raw))
+            email_contexts.append(redact_contact_line(line))
+    return {
+        "phone_like_count": len(list(dict.fromkeys(phone_values))),
+        "phone_like_values_redacted": list(dict.fromkeys(phone_values)),
+        "phone_like_contexts_redacted": list(dict.fromkeys(phone_contexts))[:10],
+        "email_like_count": len(list(dict.fromkeys(email_values))),
+        "email_like_values_redacted": list(dict.fromkeys(email_values)),
+        "email_like_contexts_redacted": list(dict.fromkeys(email_contexts))[:10],
+    }
+
+
+def extract_document_date_lines(lines: list[str]) -> list[str]:
+    hits = []
+    for line in lines:
+        if DOC_DATE_LINE_RE.search(line) and DATE_VALUE_RE.search(line):
+            hits.append(clean_ws(line))
+    return list(dict.fromkeys(hits))[:25]
+
+
+def extract_address_blocks(lines: list[str]) -> list[str]:
+    return extract_blocks(
+        lines,
+        (
+            "RECORDING REQUESTED BY",
+            "WHEN RECORDED MAIL TO",
+            "MAIL TAX STATEMENTS TO",
+            "MAIL TO",
+            "RETURN TO",
+            "PREPARED BY",
+            "SEND TAX STATEMENTS TO",
+        ),
+    )
+
+
 def extract_resource_terms(text: str) -> list[str]:
     upper = upper_blob(text)
     hits = []
@@ -408,11 +513,14 @@ def analyze_text(doc: str, text: str, meta: dict[str, str], text_path: Path, sta
     jurisdictions = [d["jurisdiction"] for d in foreign]
     recording_block = extract_block(lines, ("RECORDING REQUESTED BY", "REQUESTED BY"))
     mail_block = extract_block(lines, ("WHEN RECORDED MAIL TO", "MAIL TAX STATEMENTS TO", "MAIL TO"))
+    address_blocks = extract_address_blocks(lines)
     mail_country, mail_foreign = country_from_block(mail_block)
     apns = extract_apns(analysis_text)
     body_grantee = extract_body_grantee(analysis_text)
     taxes_raw, estimates_json, estimate_conf = extract_transfer_taxes(analysis_text)
     company_numbers = extract_company_numbers(analysis_text)
+    contact_signals = extract_contact_like_signals(lines)
+    document_date_lines = extract_document_date_lines(lines)
     upper = upper_blob(analysis_text)
     mineral_hits = extract_resource_terms(analysis_text)
     trust_signal = bool(re.search(r"\bTRUSTEE\b|\bTRUST\b|\bTRUSTOR\b|\bBENEFICIARY\b", upper))
@@ -432,6 +540,12 @@ def analyze_text(doc: str, text: str, meta: dict[str, str], text_path: Path, sta
         tags.append("trust_or_trustee_language")
     if estimates_json != "[]":
         tags.append("transfer_tax_price_proxy_low_confidence")
+    if contact_signals["phone_like_count"]:
+        tags.append("phone_like_text_present_not_contact_ready")
+    if contact_signals["email_like_count"]:
+        tags.append("email_like_text_present_not_contact_ready")
+    if document_date_lines:
+        tags.append("document_date_or_recording_stamp_text")
     if any(s.startswith("ocr_engine_missing") for s in statuses):
         tags.append("ocr_engine_missing")
 
@@ -453,14 +567,22 @@ def analyze_text(doc: str, text: str, meta: dict[str, str], text_path: Path, sta
         "mail_to_raw": mail_block,
         "mail_to_country": mail_country,
         "mail_to_international_flag": str(mail_foreign).lower(),
+        "address_blocks_raw": join_unique(address_blocks),
         "body_grantee_raw": body_grantee,
         "entity_domicile_phrases": json.dumps(domiciles, ensure_ascii=False),
         "foreign_entity_jurisdictions": join_unique(jurisdictions),
         "foreign_entity_flag": str(bool(foreign)).lower(),
         "company_numbers": join_unique(company_numbers),
+        "document_date_lines_raw": join_unique(document_date_lines),
         "transfer_tax_raw": taxes_raw,
         "estimated_consideration_from_county_tax": estimates_json,
         "consideration_confidence": estimate_conf,
+        "phone_like_count": str(contact_signals["phone_like_count"]),
+        "phone_like_values_redacted": json.dumps(contact_signals["phone_like_values_redacted"], ensure_ascii=False),
+        "phone_like_contexts_redacted": json.dumps(contact_signals["phone_like_contexts_redacted"], ensure_ascii=False),
+        "email_like_count": str(contact_signals["email_like_count"]),
+        "email_like_values_redacted": json.dumps(contact_signals["email_like_values_redacted"], ensure_ascii=False),
+        "email_like_contexts_redacted": json.dumps(contact_signals["email_like_contexts_redacted"], ensure_ascii=False),
         "mineral_rights_signal": str(bool(mineral_hits)).lower(),
         "mineral_terms": join_unique(mineral_hits),
         "trustee_trust_signal": str(trust_signal).lower(),
@@ -474,10 +596,13 @@ FIELDS = [
     "index_grantors", "index_grantees", "ocr_status", "ocr_engines",
     "pages_ocrd", "ocr_text_path", "ocr_text_sha256", "ocr_chars", "apns_all",
     "recording_requested_by_raw", "mail_to_raw", "mail_to_country",
-    "mail_to_international_flag", "body_grantee_raw", "entity_domicile_phrases",
+    "mail_to_international_flag", "address_blocks_raw", "body_grantee_raw", "entity_domicile_phrases",
     "foreign_entity_jurisdictions", "foreign_entity_flag", "company_numbers",
+    "document_date_lines_raw",
     "transfer_tax_raw", "estimated_consideration_from_county_tax",
-    "consideration_confidence", "mineral_rights_signal", "mineral_terms",
+    "consideration_confidence", "phone_like_count", "phone_like_values_redacted",
+    "phone_like_contexts_redacted", "email_like_count", "email_like_values_redacted",
+    "email_like_contexts_redacted", "mineral_rights_signal", "mineral_terms",
     "trustee_trust_signal", "corporate_party_from_index_flag",
     "buyer_seller_intel_tags",
 ]
@@ -517,8 +642,11 @@ def run(png_dir: Path, index_csv: Path, out_dir: Path, ocr_bin: str | None) -> i
         "foreign_entity_docs": sum(1 for r in rows if r["foreign_entity_flag"] == "true"),
         "international_mail_docs": sum(1 for r in rows if r["mail_to_international_flag"] == "true"),
         "mineral_signal_docs": sum(1 for r in rows if r["mineral_rights_signal"] == "true"),
+        "phone_like_signal_docs": sum(1 for r in rows if int(r.get("phone_like_count") or 0) > 0),
+        "email_like_signal_docs": sum(1 for r in rows if int(r.get("email_like_count") or 0) > 0),
         "ocr_status_counts": dict(status_counts),
         "tag_counts": dict(tag_counts),
+        "raw_contacts_exported": 0,
         "outputs": {
             "deed_body_intelligence_csv": str(csv_path),
             "ocr_text_dir": str(text_dir),
@@ -547,6 +675,8 @@ def self_test() -> int:
     APN#2848-010-011, APN#2848-010-021, APN#2848-010-022 and APN#2848-011-001.
     patented placer mining claims, mineral, oil and gas rights.
     Documentary Transfer Tax $ None
+    Dated: APR 26, 2017
+    Prepared by Example Escrow (213) 555-0188 docs@example.com
 
     Yahirushi Co, Ltd., a Japan Corporation accepts title.
     Example UAE Buyer Ltd, a Dubai company, also appears.
@@ -561,6 +691,9 @@ def self_test() -> int:
     assert row["mail_to_international_flag"] == "true", row
     assert row["mineral_rights_signal"] == "true", row
     assert "2848-010-011" in row["apns_all"], row
+    assert row["phone_like_count"] == "1", row
+    assert row["email_like_count"] == "1", row
+    assert "document_date_or_recording_stamp_text" in row["buyer_seller_intel_tags"], row
     noise = analyze_text(
         "20260000000",
         "NOTICE OF DEFAULT AND ELECTION TO SELL UNDER DEED OF TRUST Claim of Lien gas service account",
