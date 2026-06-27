@@ -52,6 +52,19 @@ jobs:
                           seen.add(doc)
                           docs.append(doc)
           docs = sorted(docs, key=lambda d: int(d) if d.isdigit() else d)
+          with open("doclists/doc_metadata.csv", "w", newline="", encoding="utf-8") as fh:
+              writer = csv.DictWriter(fh, fieldnames=["doc_no", "ain", "record_date", "county_type", "grantors", "grantees", "lead_class"])
+              writer.writeheader()
+              for doc in docs:
+                  writer.writerow({
+                      "doc_no": doc,
+                      "ain": "[]",
+                      "record_date": "[]",
+                      "county_type": "[]",
+                      "grantors": "[]",
+                      "grantees": "[]",
+                      "lead_class": "[]",
+                  })
           per = -(-len(docs) // shards) if docs else 1
           include = []
           for i in range(shards):
@@ -81,6 +94,10 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+      - name: install OCR engine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
       - uses: actions/download-artifact@v4
         with:
           name: retry-doc-page-lists-${{ inputs.source_page_run_id }}
@@ -96,6 +113,11 @@ jobs:
             --attempts "${{ inputs.attempts }}" \
             --delay-min "${{ inputs.delay_min }}" \
             --delay-max "${{ inputs.delay_max }}"
+      - name: extract deed-body buyer/seller intelligence
+        if: always()
+        run: |
+          mkdir -p out/deed_intel
+          python3 deed_body_intelligence.py out doclists/doc_metadata.csv out/deed_intel
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -105,3 +127,6 @@ jobs:
       - name: fail visibly if retry pages are still missing or capped
         if: always()
         run: python3 check_doc_pages_complete.py out
+      - name: fail visibly if deed OCR/intelligence is blank
+        if: always()
+        run: python3 check_deed_intelligence_complete.py out/deed_intel

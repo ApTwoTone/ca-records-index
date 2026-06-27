@@ -40,17 +40,54 @@ jobs:
           max_docs = int(sys.argv[2])
           docs = []
           seen = set()
+          meta = {}
+          def add_meta(doc, row):
+              rec = meta.setdefault(doc, {
+                  "doc_no": doc, "ain": set(), "record_date": set(),
+                  "county_type": set(), "grantors": set(), "grantees": set(),
+                  "lead_class": set(),
+              })
+              for key in ("ain", "record_date", "county_type", "lead_class"):
+                  val = (row.get(key) or "").strip()
+                  if val:
+                      rec[key].add(val)
+              for key in ("grantors", "grantees"):
+                  raw = (row.get(key) or "").strip()
+                  if not raw:
+                      continue
+                  try:
+                      parsed = json.loads(raw)
+                      vals = parsed if isinstance(parsed, list) else [raw]
+                  except Exception:
+                      vals = [v.strip() for v in raw.replace("|", ";").split(";")]
+                  for val in vals:
+                      val = str(val).strip()
+                      if val:
+                          rec[key].add(val)
           for path in sorted(glob.glob("artifacts/**/*_docs.csv", recursive=True)):
               with open(path, newline="", encoding="utf-8") as fh:
                   for row in csv.DictReader(fh):
                       doc = (row.get("doc_no") or "").strip()
                       if not doc or doc in seen:
+                          if doc:
+                              add_meta(doc, row)
                           continue
+                      add_meta(doc, row)
                       seen.add(doc)
                       docs.append(doc)
           docs = sorted(docs, key=lambda d: int(d) if d.isdigit() else d)
           if max_docs > 0:
               docs = docs[:max_docs]
+          with open("doclists/doc_metadata.csv", "w", newline="", encoding="utf-8") as fh:
+              fields = ["doc_no", "ain", "record_date", "county_type", "grantors", "grantees", "lead_class"]
+              writer = csv.DictWriter(fh, fieldnames=fields)
+              writer.writeheader()
+              for doc in docs:
+                  rec = meta.get(doc, {"doc_no": doc})
+                  out = {"doc_no": doc}
+                  for key in fields[1:]:
+                      out[key] = json.dumps(sorted(rec.get(key, set())))
+                  writer.writerow(out)
           per = -(-len(docs) // shards) if docs else 1
           include = []
           for i in range(shards):
@@ -80,6 +117,10 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+      - name: install OCR engine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
       - uses: actions/download-artifact@v4
         with:
           name: doc-page-lists-${{ inputs.ain_run_id }}
@@ -95,6 +136,11 @@ jobs:
             --attempts "${{ inputs.attempts }}" \
             --delay-min "${{ inputs.delay_min }}" \
             --delay-max "${{ inputs.delay_max }}"
+      - name: extract deed-body buyer/seller intelligence
+        if: always()
+        run: |
+          mkdir -p out/deed_intel
+          python3 deed_body_intelligence.py out doclists/doc_metadata.csv out/deed_intel
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -104,3 +150,6 @@ jobs:
       - name: fail visibly if pages are missing or capped
         if: always()
         run: python3 check_doc_pages_complete.py out
+      - name: fail visibly if deed OCR/intelligence is blank
+        if: always()
+        run: python3 check_deed_intelligence_complete.py out/deed_intel
