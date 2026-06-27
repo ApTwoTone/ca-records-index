@@ -151,6 +151,7 @@ def analyze(input_csv: Path, out_dir: Path) -> dict:
     international_mail = []
     resource_candidates = []
     transfer_tax_clues = []
+    contact_signal_review = []
     doc_signal_matrix = []
     jurisdiction_counts = Counter()
     region_counts = Counter()
@@ -189,10 +190,16 @@ def analyze(input_csv: Path, out_dir: Path) -> dict:
             "foreign_entity_jurisdictions": row.get("foreign_entity_jurisdictions", "[]"),
             "mail_to_international_flag": row.get("mail_to_international_flag", ""),
             "mail_to_country": row.get("mail_to_country", ""),
+            "address_blocks_raw": row.get("address_blocks_raw", "[]"),
             "mineral_rights_signal": row.get("mineral_rights_signal", ""),
             "transfer_tax_raw": row.get("transfer_tax_raw", ""),
             "estimated_consideration_from_county_tax": row.get("estimated_consideration_from_county_tax", "[]"),
             "company_numbers": row.get("company_numbers", "[]"),
+            "document_date_lines_raw": row.get("document_date_lines_raw", "[]"),
+            "phone_like_count": row.get("phone_like_count", "0"),
+            "phone_like_values_redacted": row.get("phone_like_values_redacted", "[]"),
+            "email_like_count": row.get("email_like_count", "0"),
+            "email_like_values_redacted": row.get("email_like_values_redacted", "[]"),
             "tags": row.get("buyer_seller_intel_tags", "[]"),
             "readiness": READINESS,
         })
@@ -287,6 +294,24 @@ def analyze(input_csv: Path, out_dir: Path) -> dict:
                 "next_action": "verify_county_city_tax_rate_exemptions_and_deed_consideration",
             })
 
+        phone_count = int(row.get("phone_like_count") or 0)
+        email_count = int(row.get("email_like_count") or 0)
+        if phone_count or email_count:
+            contact_signal_review.append({
+                "doc_no": doc_no,
+                "phone_like_count": phone_count,
+                "phone_like_values_redacted": row.get("phone_like_values_redacted", "[]"),
+                "phone_like_contexts_redacted": row.get("phone_like_contexts_redacted", "[]"),
+                "email_like_count": email_count,
+                "email_like_values_redacted": row.get("email_like_values_redacted", "[]"),
+                "email_like_contexts_redacted": row.get("email_like_contexts_redacted", "[]"),
+                "index_ains": join_json(ains),
+                "index_record_dates": join_json(record_dates),
+                "index_county_types": join_json(county_types),
+                "commercial_readiness": "contact_signal_only_not_callable",
+                "next_action": "preserve_raw_ocr_then_route_owner_identity_skiptrace_dnc_tcpa_before_any_call_use",
+            })
+
     rollup_rows = []
     for roll in entity_rollups.values():
         rollup_rows.append({
@@ -349,11 +374,21 @@ def analyze(input_csv: Path, out_dir: Path) -> dict:
         "doc_no", "transfer_tax_raw", "estimated_consideration_from_county_tax",
         "consideration_confidence", "commercial_readiness", "next_action",
     ])
+    write_csv(out_dir / "contact_like_signal_review.csv", contact_signal_review, [
+        "doc_no", "phone_like_count", "phone_like_values_redacted",
+        "phone_like_contexts_redacted", "email_like_count",
+        "email_like_values_redacted", "email_like_contexts_redacted",
+        "index_ains", "index_record_dates", "index_county_types",
+        "commercial_readiness", "next_action",
+    ])
     write_csv(out_dir / "doc_signal_matrix.csv", doc_signal_matrix, [
         "doc_no", "foreign_entity_flag", "foreign_entity_jurisdictions",
-        "mail_to_international_flag", "mail_to_country", "mineral_rights_signal",
+        "mail_to_international_flag", "mail_to_country", "address_blocks_raw",
+        "mineral_rights_signal",
         "transfer_tax_raw", "estimated_consideration_from_county_tax",
-        "company_numbers", "tags", "readiness",
+        "company_numbers", "document_date_lines_raw", "phone_like_count",
+        "phone_like_values_redacted", "email_like_count", "email_like_values_redacted",
+        "tags", "readiness",
     ])
 
     summary = {
@@ -368,6 +403,7 @@ def analyze(input_csv: Path, out_dir: Path) -> dict:
         "international_mail_candidates": len(international_mail),
         "resource_rights_candidates": len(resource_candidates),
         "transfer_tax_price_clues": len(transfer_tax_clues),
+        "contact_like_signal_review_rows": len(contact_signal_review),
         "tag_counts": dict(tag_counts),
         "commercial_readiness": READINESS,
         "raw_contacts_exported": 0,
@@ -378,6 +414,7 @@ def analyze(input_csv: Path, out_dir: Path) -> dict:
             "international_mail_candidates_csv": str(out_dir / "international_mail_candidates.csv"),
             "resource_rights_candidates_csv": str(out_dir / "resource_rights_candidates.csv"),
             "transfer_tax_price_clues_csv": str(out_dir / "transfer_tax_price_clues.csv"),
+            "contact_like_signal_review_csv": str(out_dir / "contact_like_signal_review.csv"),
             "doc_signal_matrix_csv": str(out_dir / "doc_signal_matrix.csv"),
         },
     }
