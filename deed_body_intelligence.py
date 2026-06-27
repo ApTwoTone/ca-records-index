@@ -122,6 +122,7 @@ TRANSFER_TAX_RE = re.compile(
     re.I,
 )
 COMPANY_NO_RE = re.compile(r"\b(?:COMPANY|REGISTRATION|ENTITY|FILE)\s+(?:NO|NUMBER|#)\.?\s*[:#]?\s*([A-Z0-9\-]{3,30})\b", re.I)
+OCR_CONFIDENCE_PREFIX_RE = re.compile(r"(?m)^\s*(?:0|1)(?:\.\d{1,3})?\s+")
 
 
 def now_utc() -> str:
@@ -136,14 +137,27 @@ def upper_blob(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").upper())
 
 
+def strip_ocr_confidence_prefixes(text: str) -> str:
+    """Apple Vision wrappers often prefix each OCR line with confidence like 1.00."""
+    return OCR_CONFIDENCE_PREFIX_RE.sub("", text or "")
+
+
 def split_jsonish(value: str) -> list[str]:
     value = (value or "").strip()
     if not value:
         return []
     try:
         parsed = json.loads(value)
-        if isinstance(parsed, list):
-            return [clean_ws(str(v)) for v in parsed if clean_ws(str(v))]
+        values = parsed if isinstance(parsed, list) else [parsed]
+        flattened = []
+        for item in values:
+            if isinstance(item, str) and item.strip().startswith("["):
+                flattened.extend(split_jsonish(item))
+            else:
+                cleaned = clean_ws(str(item))
+                if cleaned:
+                    flattened.append(cleaned)
+        return flattened
     except Exception:
         pass
     return [clean_ws(v) for v in re.split(r";|\|", value) if clean_ws(v)]
@@ -172,11 +186,9 @@ def load_index(path: Path) -> dict[str, dict[str, str]]:
                 continue
             for field in ["ain", "record_date", "county_type", "grantors", "grantees", "lead_class"]:
                 raw = row.get(field) or ""
-                if field in {"grantors", "grantees"}:
+                if field in {"ain", "record_date", "county_type", "lead_class", "grantors", "grantees"}:
                     for item in split_jsonish(raw):
                         by_doc[doc][field].add(item)
-                elif clean_ws(raw):
-                    by_doc[doc][field].add(clean_ws(raw))
     return {
         doc: {field: join_unique(sorted(values)) for field, values in fields.items()}
         for doc, fields in by_doc.items()
@@ -243,7 +255,10 @@ def canonical_jurisdiction(raw: str) -> tuple[str, str, bool]:
     blob = re.sub(r"\s+", " ", blob).strip()
     if blob in US_STATES:
         return blob.title(), "us", False
-    return clean_ws(raw).title(), "unknown", bool(raw and blob not in US_STATES)
+    # Unknown free text is kept for manual review but must not inflate foreign
+    # counts. OCR can over-capture clause fragments such as "the following
+    # described real property ... SAR corporation".
+    return clean_ws(raw).title(), "unknown", False
 
 
 def extract_entity_domiciles(text: str) -> list[dict[str, str]]:
@@ -290,8 +305,9 @@ def extract_entity_domiciles(text: str) -> list[dict[str, str]]:
     return out
 
 
-def extract_block(lines: list[str], starts: tuple[str, ...], max_lines: int = 8) -> str:
+def extract_block(lines: list[str], starts: tuple[str, ...], max_lines: int = 12) -> str:
     starts_upper = tuple(s.upper() for s in starts)
+    blocks = []
     for i, line in enumerate(lines):
         up = line.upper()
         if any(s in up for s in starts_upper):
@@ -305,8 +321,11 @@ def extract_block(lines: list[str], starts: tuple[str, ...], max_lines: int = 8)
                 if re.search(r"^(SPACE ABOVE|DOCUMENTARY|THIS CONVEYANCE|GRANTOR|GRANTEE|EXHIBIT|LEGAL DESCRIPTION)\b", clean, re.I):
                     break
                 block.append(clean)
-            return " | ".join(clean_ws(x) for x in block if clean_ws(x))
-    return ""
+            blocks.append(" | ".join(clean_ws(x) for x in block if clean_ws(x)))
+    for block in blocks:
+        if country_from_block(block)[1]:
+            return block
+    return blocks[0] if blocks else ""
 
 
 def country_from_block(block: str) -> tuple[str, bool]:
@@ -362,19 +381,20 @@ def entity_suffix_flag(values: Iterable[str]) -> bool:
 
 
 def analyze_text(doc: str, text: str, meta: dict[str, str], text_path: Path, statuses: list[str]) -> dict[str, str]:
-    lines = [clean_ws(line) for line in text.splitlines() if clean_ws(line)]
+    analysis_text = strip_ocr_confidence_prefixes(text)
+    lines = [clean_ws(line) for line in analysis_text.splitlines() if clean_ws(line)]
     text_sha = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
-    domiciles = extract_entity_domiciles(text)
+    domiciles = extract_entity_domiciles(analysis_text)
     foreign = [d for d in domiciles if d["is_foreign"] == "true"]
     jurisdictions = [d["jurisdiction"] for d in foreign]
     recording_block = extract_block(lines, ("RECORDING REQUESTED BY", "REQUESTED BY"))
     mail_block = extract_block(lines, ("WHEN RECORDED MAIL TO", "MAIL TAX STATEMENTS TO", "MAIL TO"))
     mail_country, mail_foreign = country_from_block(mail_block)
-    apns = extract_apns(text)
-    body_grantee = extract_body_grantee(text)
-    taxes_raw, estimates_json, estimate_conf = extract_transfer_taxes(text)
-    company_numbers = extract_company_numbers(text)
-    upper = upper_blob(text)
+    apns = extract_apns(analysis_text)
+    body_grantee = extract_body_grantee(analysis_text)
+    taxes_raw, estimates_json, estimate_conf = extract_transfer_taxes(analysis_text)
+    company_numbers = extract_company_numbers(analysis_text)
+    upper = upper_blob(analysis_text)
     mineral_hits = [term for term in MINERAL_TERMS if term in upper]
     trust_signal = bool(re.search(r"\bTRUSTEE\b|\bTRUST\b|\bTRUSTOR\b|\bBENEFICIARY\b", upper))
     corp_party = entity_suffix_flag(split_jsonish(meta.get("grantors", "")) + split_jsonish(meta.get("grantees", "")))

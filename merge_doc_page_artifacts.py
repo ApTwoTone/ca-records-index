@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import sys
 
+import analyze_deed_body_patterns
+
 
 def read_csvs(pattern: str) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
@@ -52,7 +54,11 @@ def main() -> int:
     write_union_csv(out_dir / "pages_manifest_merged.csv", pages)
     write_union_csv(out_dir / "failed_pages_merged.csv", failed)
     write_union_csv(out_dir / "doc_status_merged.csv", statuses)
-    write_union_csv(out_dir / "deed_body_intelligence_merged.csv", deed_intel)
+    deed_intel_out = out_dir / "deed_body_intelligence_merged.csv"
+    write_union_csv(deed_intel_out, deed_intel)
+    pattern_summary = {}
+    if deed_intel:
+        pattern_summary = analyze_deed_body_patterns.analyze(deed_intel_out, out_dir / "patterns")
 
     status_counts = Counter(row.get("status", "") for row in statuses)
     ocr_counts = Counter(row.get("ocr_status", "") for row in deed_intel)
@@ -82,7 +88,8 @@ def main() -> int:
             "pages_manifest_merged_csv": str(out_dir / "pages_manifest_merged.csv"),
             "failed_pages_merged_csv": str(out_dir / "failed_pages_merged.csv"),
             "doc_status_merged_csv": str(out_dir / "doc_status_merged.csv"),
-            "deed_body_intelligence_merged_csv": str(out_dir / "deed_body_intelligence_merged.csv"),
+            "deed_body_intelligence_merged_csv": str(deed_intel_out),
+            "pattern_summary_json": pattern_summary.get("outputs", {}),
         },
     }
     (out_dir / "doc_page_artifacts_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
