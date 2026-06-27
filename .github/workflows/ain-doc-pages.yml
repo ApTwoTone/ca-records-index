@@ -1,0 +1,101 @@
+name: ain-doc-pages
+# Pull page images for every document discovered by a completed ain-fanout run.
+# The plan job downloads the AIN run artifacts, extracts unique doc_no values
+# from *_docs.csv, writes per-shard doc lists, and the pull jobs fetch pages
+# through pull_docs.py with resumable manifests and failed_pages.csv output.
+on:
+  workflow_dispatch:
+    inputs:
+      ain_run_id: { required: true, type: string }
+      pages: { required: false, type: string, default: "25" }
+      shards: { required: false, type: string, default: "4" }
+      delay_min: { required: false, type: string, default: "5.0" }
+      delay_max: { required: false, type: string, default: "7.0" }
+      max_docs: { required: false, type: string, default: "0" }
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      doc_count: ${{ steps.gen.outputs.doc_count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: download AIN artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p artifacts doclists
+          gh run download "${{ inputs.ain_run_id }}" -R "${{ github.repository }}" -D artifacts
+      - id: gen
+        run: |
+          python3 - "${{ inputs.shards }}" "${{ inputs.max_docs }}" <<'PY' >> "$GITHUB_OUTPUT"
+          import csv, glob, json, os, sys
+          shards = max(1, int(sys.argv[1]))
+          max_docs = int(sys.argv[2])
+          docs = []
+          seen = set()
+          for path in sorted(glob.glob("artifacts/**/*_docs.csv", recursive=True)):
+              with open(path, newline="", encoding="utf-8") as fh:
+                  for row in csv.DictReader(fh):
+                      doc = (row.get("doc_no") or "").strip()
+                      if not doc or doc in seen:
+                          continue
+                      seen.add(doc)
+                      docs.append(doc)
+          docs = sorted(docs, key=lambda d: int(d) if d.isdigit() else d)
+          if max_docs > 0:
+              docs = docs[:max_docs]
+          per = -(-len(docs) // shards) if docs else 1
+          include = []
+          for i in range(shards):
+              chunk = docs[i * per:(i + 1) * per]
+              if not chunk:
+                  continue
+              path = f"doclists/doclist_{i}.txt"
+              with open(path, "w", encoding="utf-8") as fh:
+                  fh.write("\n".join(chunk) + "\n")
+              include.append({"i": i, "count": len(chunk)})
+          print("matrix=" + json.dumps({"include": include}))
+          print("doc_count=" + str(len(docs)))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: doc-page-lists-${{ inputs.ain_run_id }}
+          path: doclists/
+          retention-days: 3
+
+  pull:
+    needs: plan
+    if: ${{ needs.plan.outputs.doc_count != '0' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: doc-page-lists-${{ inputs.ain_run_id }}
+          path: doclists
+      - name: pull pages for shard ${{ matrix.i }}
+        env:
+          NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
+        run: |
+          test -n "$NETR_PROXY_KEY"
+          mkdir -p out
+          python3 pull_docs.py "doclists/doclist_${{ matrix.i }}.txt" out \
+            --max-pages "${{ inputs.pages }}" \
+            --delay-min "${{ inputs.delay_min }}" \
+            --delay-max "${{ inputs.delay_max }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: doc-pages-${{ inputs.ain_run_id }}-${{ matrix.i }}
+          path: out/
+          retention-days: 3
