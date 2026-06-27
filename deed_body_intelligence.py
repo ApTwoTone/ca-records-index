@@ -106,9 +106,19 @@ JURISDICTION_ALIASES = [
     (r"\bNEW\s+ZEALAND\b", "New Zealand", "oceania"),
 ]
 
-MINERAL_TERMS = [
-    "MINERAL", "MINING", "PLACER", "LODE", "PATENTED", "CLAIM", "OIL",
-    "GAS", "HYDROCARBON", "ROYALTY", "WATER RIGHTS", "TIMBER", "EASEMENT",
+RESOURCE_PATTERNS = [
+    (r"\bPATENTED\s+(?:PLACER\s+)?(?:MINING\s+)?CLAIMS?\b", "PATENTED_PLACER_MINING_CLAIM"),
+    (r"\bPLACER\s+(?:MINING\s+)?CLAIMS?\b", "PLACER_MINING_CLAIM"),
+    (r"\bLODE\s+(?:MINING\s+)?CLAIMS?\b", "LODE_MINING_CLAIM"),
+    (r"\bMINERAL(?:S)?\b", "MINERAL"),
+    (r"\bMINING\b", "MINING"),
+    (r"\bPLACER\b", "PLACER"),
+    (r"\bHYDROCARBON(?:S)?\b", "HYDROCARBON"),
+    (r"\bOIL\s+(?:AND|&|/)\s+GAS\b|\bGAS\s+(?:AND|&|/)\s+OIL\b", "OIL_AND_GAS"),
+    (r"\bROYALT(?:Y|IES)\b", "ROYALTY"),
+    (r"\bWATER\s+RIGHTS?\b", "WATER_RIGHTS"),
+    (r"\bTIMBER\s+RIGHTS?\b|\bTIMBER\b", "TIMBER"),
+    (r"\bEASEMENT(?:S)?\b", "EASEMENT"),
 ]
 
 APN_RE = re.compile(
@@ -198,7 +208,7 @@ def load_index(path: Path) -> dict[str, dict[str, str]]:
 def group_pages(png_dir: Path) -> dict[str, list[Path]]:
     pages: dict[str, list[tuple[int, Path]]] = defaultdict(list)
     for path in png_dir.glob("**/*.png"):
-        match = re.match(r"(\d+)_(\d+)\.png$", path.name)
+        match = re.match(r"(\d+)_p?(\d+)\.png$", path.name, re.I)
         if not match:
             continue
         pages[match.group(1)].append((int(match.group(2)), path))
@@ -375,6 +385,15 @@ def extract_company_numbers(text: str) -> list[str]:
     return list(dict.fromkeys(clean_ws(m.group(1)) for m in COMPANY_NO_RE.finditer(text or "")))
 
 
+def extract_resource_terms(text: str) -> list[str]:
+    upper = upper_blob(text)
+    hits = []
+    for pattern, label in RESOURCE_PATTERNS:
+        if re.search(pattern, upper, re.I):
+            hits.append(label)
+    return list(dict.fromkeys(hits))
+
+
 def entity_suffix_flag(values: Iterable[str]) -> bool:
     blob = upper_blob(" ".join(values))
     return any(re.search(r"\b%s\b" % re.escape(t), blob) for t in ENTITY_TYPES)
@@ -395,7 +414,7 @@ def analyze_text(doc: str, text: str, meta: dict[str, str], text_path: Path, sta
     taxes_raw, estimates_json, estimate_conf = extract_transfer_taxes(analysis_text)
     company_numbers = extract_company_numbers(analysis_text)
     upper = upper_blob(analysis_text)
-    mineral_hits = [term for term in MINERAL_TERMS if term in upper]
+    mineral_hits = extract_resource_terms(analysis_text)
     trust_signal = bool(re.search(r"\bTRUSTEE\b|\bTRUST\b|\bTRUSTOR\b|\bBENEFICIARY\b", upper))
     corp_party = entity_suffix_flag(split_jsonish(meta.get("grantors", "")) + split_jsonish(meta.get("grantees", "")))
     tags = []
@@ -542,6 +561,14 @@ def self_test() -> int:
     assert row["mail_to_international_flag"] == "true", row
     assert row["mineral_rights_signal"] == "true", row
     assert "2848-010-011" in row["apns_all"], row
+    noise = analyze_text(
+        "20260000000",
+        "NOTICE OF DEFAULT AND ELECTION TO SELL UNDER DEED OF TRUST Claim of Lien gas service account",
+        {},
+        Path("ocr_text/20260000000.txt"),
+        ["ok_self_test"],
+    )
+    assert noise["mineral_rights_signal"] == "false", noise
     print("self_test_ok")
     return 0
 
