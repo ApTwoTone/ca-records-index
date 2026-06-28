@@ -29,7 +29,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Iterable
+
+try:
+    from PIL import Image, ImageOps
+except Exception:  # pragma: no cover - optional runtime dependency
+    Image = None
+    ImageOps = None
 
 
 ENTITY_TYPES = (
@@ -251,6 +258,89 @@ def group_pages(png_dir: Path) -> dict[str, list[Path]]:
     return {doc: [path for _, path in sorted(items)] for doc, items in pages.items()}
 
 
+OCR_QUALITY_TERMS = (
+    "GRANTOR", "GRANTEE", "GRANTS", "CORPORATION", "COMPANY", "LIMITED",
+    "HONG KONG", "JAPAN", "DUBAI", "UNITED ARAB", "APN", "PARCEL",
+    "RECORDING REQUESTED", "MAIL TAX", "TRANSFER TAX", "TRUST TRANSFER",
+)
+
+
+def ocr_quality_score(text: str) -> float:
+    upper = upper_blob(text or "")
+    words = re.findall(r"[A-Z]{3,}", upper)
+    score = min(len(words), 500) * 0.2
+    for term in OCR_QUALITY_TERMS:
+        if term in upper:
+            score += 20
+    # Penalize outputs dominated by OCR confetti.
+    if text:
+        alpha_ratio = sum(ch.isalpha() for ch in text) / max(len(text), 1)
+        score += alpha_ratio * 50
+    return score
+
+
+def preprocess_for_tesseract(path: Path) -> Path | None:
+    if Image is None or ImageOps is None:
+        return None
+    try:
+        image = Image.open(path).convert("RGB")
+    except Exception:
+        return None
+
+    # NETR preview pages carry a diagonal green watermark that can dominate
+    # Tesseract. Remove green-dominant pixels before upscaling.
+    pixels = image.load()
+    width, height = image.size
+    for y in range(height):
+        for x in range(width):
+            r, g, b = pixels[x, y]
+            if g > 70 and g > r + 18 and g > b + 18:
+                pixels[x, y] = (255, 255, 255)
+
+    gray = ImageOps.grayscale(image)
+    gray = ImageOps.autocontrast(gray)
+    scale = 3
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    gray = gray.resize((width * scale, height * scale), resample)
+    tmp = tempfile.NamedTemporaryFile(prefix="netr_ocr_", suffix=".png", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        gray.save(tmp_path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return None
+    return tmp_path
+
+
+def run_tesseract(tess: str, path: Path, psm: str, label: str) -> tuple[str, str, float]:
+    try:
+        proc = subprocess.run(
+            [
+                tess,
+                str(path),
+                "stdout",
+                "--oem",
+                "1",
+                "--psm",
+                psm,
+                "-c",
+                "preserve_interword_spaces=1",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        text = proc.stdout if proc.returncode == 0 else (proc.stdout or proc.stderr)
+        status = f"{label}_psm{psm}" if proc.returncode == 0 else f"{label}_psm{psm}_exit_{proc.returncode}"
+        return text, status, ocr_quality_score(text)
+    except Exception as exc:
+        return "", f"{label}_psm{psm}_error_{type(exc).__name__}", 0.0
+
+
 def ocr_one(path: Path, ocr_bin: str | None) -> tuple[str, str]:
     if ocr_bin and Path(ocr_bin).exists():
         try:
@@ -263,13 +353,39 @@ def ocr_one(path: Path, ocr_bin: str | None) -> tuple[str, str]:
 
     tess = shutil.which("tesseract")
     if tess:
+        attempts: list[tuple[str, str, float]] = []
+        temp_paths: list[Path] = []
         try:
-            proc = subprocess.run([tess, str(path), "stdout", "--psm", "6"], text=True, capture_output=True, timeout=120)
-            if proc.returncode == 0:
-                return proc.stdout, "ok_tesseract"
-            return proc.stdout or proc.stderr, f"tesseract_exit_{proc.returncode}"
-        except Exception as exc:
-            return "", f"tesseract_error_{type(exc).__name__}"
+            candidates: list[tuple[Path, str, tuple[str, ...]]] = [(path, "orig", ("6", "4", "11"))]
+            preprocessed = preprocess_for_tesseract(path)
+            if preprocessed:
+                temp_paths.append(preprocessed)
+                candidates.append((preprocessed, "clean", ("6", "4", "11", "12")))
+            for candidate, label, psms in candidates:
+                for psm in psms:
+                    attempts.append(run_tesseract(tess, candidate, psm, label))
+        finally:
+            for tmp_path in temp_paths:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+        ok_attempts = [attempt for attempt in attempts if attempt[0].strip()]
+        if ok_attempts:
+            chunks = []
+            seen = set()
+            for text, status, _score in sorted(ok_attempts, key=lambda item: item[2], reverse=True):
+                digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+                if digest in seen:
+                    continue
+                seen.add(digest)
+                chunks.append(f"\n--- OCR_ATTEMPT {status} ---\n{text}")
+            return "\n".join(chunks), f"ok_tesseract_multi_{len(chunks)}"
+        if attempts:
+            text, status, _score = attempts[0]
+            return text, status
+        return "", "tesseract_no_attempts"
 
     return "", "ocr_engine_missing"
 
