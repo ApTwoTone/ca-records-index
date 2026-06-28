@@ -80,25 +80,48 @@ JURISDICTION_ALIASES = [
     (r"\bTAIWAN\b", "Taiwan", "asia"),
     (r"\bSINGAPORE\b", "Singapore", "asia"),
     (r"\bKOREA\b|\bSOUTH\s+KOREA\b", "South Korea", "asia"),
+    (r"\bINDIA\b", "India", "asia"),
+    (r"\bPHILIPPINES\b", "Philippines", "asia"),
+    (r"\bTHAILAND\b", "Thailand", "asia"),
+    (r"\bVIETNAM\b|\bVIET\s+NAM\b", "Vietnam", "asia"),
+    (r"\bMALAYSIA\b", "Malaysia", "asia"),
+    (r"\bINDONESIA\b", "Indonesia", "asia"),
     (r"\bUNITED\s+KINGDOM\b|\bU\.?K\.?\b|\bENGLAND\b|\bWALES\b|\bSCOTLAND\b", "United Kingdom", "europe"),
     (r"\bFRANCE\b|\bFRENCH\b", "France", "europe"),
     (r"\bGERMANY\b|\bDEUTSCHLAND\b", "Germany", "europe"),
     (r"\bNETHERLANDS\b|\bHOLLAND\b", "Netherlands", "europe"),
+    (r"\bBELGIUM\b", "Belgium", "europe"),
+    (r"\bPORTUGAL\b", "Portugal", "europe"),
     (r"\bLUXEMBOURG\b", "Luxembourg", "europe"),
     (r"\bSWITZERLAND\b", "Switzerland", "europe"),
     (r"\bIRELAND\b", "Ireland", "europe"),
     (r"\bITALY\b", "Italy", "europe"),
     (r"\bSPAIN\b", "Spain", "europe"),
+    (r"\bMONACO\b", "Monaco", "europe"),
+    (r"\bCYPRUS\b", "Cyprus", "europe"),
+    (r"\bMALTA\b", "Malta", "europe"),
+    (r"\bDENMARK\b", "Denmark", "europe"),
+    (r"\bNORWAY\b", "Norway", "europe"),
+    (r"\bSWEDEN\b", "Sweden", "europe"),
+    (r"\bFINLAND\b", "Finland", "europe"),
+    (r"\bAUSTRIA\b", "Austria", "europe"),
+    (r"\bCZECH\s+REPUBLIC\b|\bCZECHIA\b", "Czechia", "europe"),
     (r"\bUNITED\s+ARAB\s+EMIRATES\b|\bU\.?A\.?E\.?\b|\bDUBAI\b|\bABU\s+DHABI\b", "United Arab Emirates", "middle_east"),
     (r"\bQATAR\b", "Qatar", "middle_east"),
     (r"\bSAUDI\s+ARABIA\b", "Saudi Arabia", "middle_east"),
     (r"\bKUWAIT\b", "Kuwait", "middle_east"),
     (r"\bBAHRAIN\b", "Bahrain", "middle_east"),
+    (r"\bOMAN\b", "Oman", "middle_east"),
+    (r"\bTURKEY\b|\bTURKIYE\b", "Turkey", "middle_east"),
     (r"\bISRAEL\b", "Israel", "middle_east"),
     (r"\bLEBANON\b", "Lebanon", "middle_east"),
     (r"\bJORDAN\b", "Jordan", "middle_east"),
+    (r"\bSOUTH\s+AFRICA\b", "South Africa", "africa"),
     (r"\bCANADA\b", "Canada", "north_america"),
     (r"\bMEXICO\b", "Mexico", "north_america"),
+    (r"\bBRAZIL\b", "Brazil", "south_america"),
+    (r"\bARGENTINA\b", "Argentina", "south_america"),
+    (r"\bCHILE\b", "Chile", "south_america"),
     (r"\bBRITISH\s+VIRGIN\s+ISLANDS\b|\bBVI\b", "British Virgin Islands", "caribbean"),
     (r"\bCAYMAN\s+ISLANDS\b", "Cayman Islands", "caribbean"),
     (r"\bBERMUDA\b", "Bermuda", "caribbean"),
@@ -681,6 +704,10 @@ def self_test() -> int:
     Yahirushi Co, Ltd., a Japan Corporation accepts title.
     Example UAE Buyer Ltd, a Dubai company, also appears.
     France Holdings SARL, a France company, appears.
+    Peninsula UK Ltd, a Malta company, appears.
+    Gulf India Holdings, an India company, appears.
+    Nordic Buyer AB, a Sweden company, appears.
+    Muscat Capital LLC, an Oman company, appears.
     """
     row = analyze_text("20220482987", sample, {"grantees": json.dumps(["US PETROLEUM LIMITED"])}, Path("ocr_text/20220482987.txt"), ["ok_self_test"])
     assert row["foreign_entity_flag"] == "true", row
@@ -688,6 +715,10 @@ def self_test() -> int:
     assert "Japan" in row["foreign_entity_jurisdictions"], row
     assert "United Arab Emirates" in row["foreign_entity_jurisdictions"], row
     assert "France" in row["foreign_entity_jurisdictions"], row
+    assert "Malta" in row["foreign_entity_jurisdictions"], row
+    assert "India" in row["foreign_entity_jurisdictions"], row
+    assert "Sweden" in row["foreign_entity_jurisdictions"], row
+    assert "Oman" in row["foreign_entity_jurisdictions"], row
     assert row["mail_to_international_flag"] == "true", row
     assert row["mineral_rights_signal"] == "true", row
     assert "2848-010-011" in row["apns_all"], row
