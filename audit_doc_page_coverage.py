@@ -18,7 +18,9 @@ import signal
 import sys
 
 
-COMPLETE_DOC_STATUSES = {"done", "no_pages"}
+# A document with no fetched pages is not complete. Broken NETR preview images
+# and transient upstream 500s can otherwise masquerade as end-of-document.
+COMPLETE_DOC_STATUSES = {"done"}
 OK_PAGE_STATUSES = {"ok", "ok_existing"}
 LOW_OCR_CHAR_THRESHOLD = 40
 INPUT_READ_TIMEOUT_SECONDS = 20
@@ -295,7 +297,7 @@ def audit(root: Path, out_dir: Path, expected_doclist: Path | None = None, sourc
             reasons.append("missing_deed_body_intelligence")
         elif not ocr_status.startswith("ok"):
             reasons.append("ocr_error")
-        elif ocr_chars < LOW_OCR_CHAR_THRESHOLD and latest_status != "no_pages":
+        elif ocr_chars < LOW_OCR_CHAR_THRESHOLD:
             reasons.append("ocr_low_text")
 
         deduped_reasons = []

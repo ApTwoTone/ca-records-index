@@ -10,7 +10,10 @@ from collections import Counter
 from pathlib import Path
 
 
-COMPLETE_DOC_STATUSES = {"done", "no_pages"}
+# A valid recorder document must have at least one fetched page. NETR sometimes
+# returns an upstream 500/end marker when a preview image fails to load, so
+# `no_pages` stays retryable instead of being counted complete.
+COMPLETE_DOC_STATUSES = {"done"}
 
 
 def count_csv_rows(path: Path) -> int:
