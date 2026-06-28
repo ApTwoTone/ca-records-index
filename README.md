@@ -9,6 +9,8 @@ personal data beyond what the county publishes in its open index, no outreach.
 - `lead_class.py` — classifies a county document Type string into a lead class.
 - `doc_taxonomy.py` — CA foreclosure-stage taxonomy with negative traps.
 - `harvest_index_shard.py` — harvests a contiguous doc# range to CSV.
+- `audit_doc_page_coverage.py` — audits page/OCR artifacts into retry doclists
+  and field-presence matrices so capped, blank, or failed pages stay visible.
 - `.github/workflows/` — sharded distributed harvest across runners.
 
 Public-records research only.

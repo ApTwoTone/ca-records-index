@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 
 import analyze_deed_body_patterns
+import audit_doc_page_coverage
 
 
 def read_csvs(pattern: str) -> list[dict[str, str]]:
@@ -59,6 +60,7 @@ def main() -> int:
     pattern_summary = {}
     if deed_intel:
         pattern_summary = analyze_deed_body_patterns.analyze(deed_intel_out, out_dir / "patterns")
+    coverage_summary = audit_doc_page_coverage.audit(out_dir, out_dir / "coverage")
 
     status_counts = Counter(row.get("status", "") for row in statuses)
     ocr_counts = Counter(row.get("ocr_status", "") for row in deed_intel)
@@ -84,12 +86,14 @@ def main() -> int:
         "doc_status_counts": dict(status_counts),
         "ocr_status_counts": dict(ocr_counts),
         "buyer_seller_intel_tag_counts": dict(tags),
+        "coverage_audit": coverage_summary,
         "outputs": {
             "pages_manifest_merged_csv": str(out_dir / "pages_manifest_merged.csv"),
             "failed_pages_merged_csv": str(out_dir / "failed_pages_merged.csv"),
             "doc_status_merged_csv": str(out_dir / "doc_status_merged.csv"),
             "deed_body_intelligence_merged_csv": str(deed_intel_out),
             "pattern_summary_json": pattern_summary.get("outputs", {}),
+            "coverage_audit_json": str(out_dir / "coverage" / "audit_summary.json"),
         },
     }
     (out_dir / "doc_page_artifacts_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
