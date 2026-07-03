@@ -5,8 +5,9 @@ The script is deliberately resumable:
 - Existing valid PNGs are skipped.
 - Every requested/fetched page is written to pages_manifest.csv.
 - Failed pages are written to failed_pages.csv for an explicit re-sweep.
-- HTTP 500 from the upstream thumb endpoint is treated as end-of-document
-  only after at least one valid page was fetched for that document.
+- HTTP 500 or a non-PNG 200 payload from the upstream thumb endpoint is
+  treated as end-of-document only after at least one valid page was fetched
+  for that document.
 """
 from __future__ import annotations
 
@@ -202,6 +203,10 @@ def main() -> int:
                     total_pages += 1
                 elif status == "end":
                     mw.writerow([doc_no, page, "end", upstream, "", 0, now_utc()])
+                    doc_status = "done"
+                    break
+                elif pages_ok > 0 and status.startswith("bad_payload_"):
+                    mw.writerow([doc_no, page, "bad_payload_end", upstream, "", 0, now_utc()])
                     doc_status = "done"
                     break
                 else:
