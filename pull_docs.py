@@ -14,6 +14,8 @@ import argparse
 from collections import Counter
 import csv
 import datetime
+import hashlib
+import io
 import json
 import os
 import random
@@ -22,6 +24,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from PIL import Image
 
 
 WORKER = "https://netr-thumb.kaiescobar09.workers.dev"
@@ -49,6 +53,19 @@ def is_valid_png(path: Path) -> bool:
             return fh.read(4) == b"\x89PNG" and path.stat().st_size > 5000
     except Exception:
         return False
+
+
+def page_fingerprint_bytes(body: bytes) -> str:
+    try:
+        with Image.open(io.BytesIO(body)) as img:
+            small = img.convert("L").resize((16, 16))
+            return "img:" + bytes(small.getdata()).hex()
+    except Exception:
+        return "sha:" + hashlib.sha256(body).hexdigest()
+
+
+def page_fingerprint_file(path: Path) -> str:
+    return page_fingerprint_bytes(path.read_bytes())
 
 
 def fetch_page(key: str, doc_no: str, page: int, attempts: int) -> tuple[str, bytes | None, str]:
@@ -138,10 +155,17 @@ def main() -> int:
             pages_ok = 0
             doc_status = "max_pages_reached"
             last_page = 0
+            seen_page_digests = set()
             for page in range(1, args.max_pages + 1):
                 last_page = page
                 out = outdir / f"{doc_no}_{page}.png"
                 if is_valid_png(out):
+                    fingerprint = page_fingerprint_file(out)
+                    if pages_ok > 0 and fingerprint in seen_page_digests:
+                        mw.writerow([doc_no, page, "duplicate_end", "", "", 0, now_utc()])
+                        doc_status = "done"
+                        break
+                    seen_page_digests.add(fingerprint)
                     size = out.stat().st_size
                     mw.writerow([doc_no, page, "ok_existing", "", str(out.name), size, now_utc()])
                     pages_ok += 1
@@ -150,6 +174,12 @@ def main() -> int:
 
                 status, body, upstream = fetch_page(key, doc_no, page, args.attempts)
                 if status == "ok" and body:
+                    fingerprint = page_fingerprint_bytes(body)
+                    if pages_ok > 0 and fingerprint in seen_page_digests:
+                        mw.writerow([doc_no, page, "duplicate_end", upstream, "", 0, now_utc()])
+                        doc_status = "done"
+                        break
+                    seen_page_digests.add(fingerprint)
                     out.write_bytes(body)
                     mw.writerow([doc_no, page, "ok", upstream, str(out.name), len(body), now_utc()])
                     pages_ok += 1
