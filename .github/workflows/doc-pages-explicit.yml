@@ -15,7 +15,7 @@ on:
         type: string
         default: ""
         description: "Optional ain-fanout run id to hydrate AIN/grantor/grantee metadata"
-      pages: { required: false, type: string, default: "25" }
+      pages: { required: false, type: string, default: "80" }
       shards: { required: false, type: string, default: "1" }
       delay_min: { required: false, type: string, default: "8.0" }
       delay_max: { required: false, type: string, default: "12.0" }
