@@ -17,6 +17,7 @@ on:
 jobs:
   plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
     steps:
@@ -39,6 +40,7 @@ jobs:
   harvest:
     needs: plan
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -48,11 +50,13 @@ jobs:
       - name: install curl_cffi
         run: pip install --quiet curl_cffi
       - name: harvest shard ${{ matrix.i }}  (${{ matrix.start }}..${{ matrix.end }})
+        timeout-minutes: 12
         run: |
           mkdir -p out
           python3 harvest_index_shard.py ${{ matrix.start }} ${{ matrix.end }} \
             out/shard_${{ matrix.i }}.csv --conc ${{ inputs.conc }}
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: index-shard-${{ matrix.i }}
           path: out/
