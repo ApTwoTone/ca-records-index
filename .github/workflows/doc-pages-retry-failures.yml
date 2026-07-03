@@ -165,6 +165,7 @@ jobs:
           print(f"seeded_existing_pages={copied}")
           PY
       - name: pull retry pages for shard ${{ matrix.i }}
+        timeout-minutes: 28
         env:
           NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
         run: |

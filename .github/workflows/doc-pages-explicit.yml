@@ -172,6 +172,7 @@ jobs:
           name: explicit-doc-page-lists-${{ github.run_id }}
           path: doclists
       - name: pull explicit pages for shard ${{ matrix.i }}
+        timeout-minutes: 28
         env:
           NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
         run: |
