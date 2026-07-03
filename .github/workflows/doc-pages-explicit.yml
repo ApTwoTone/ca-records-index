@@ -175,6 +175,20 @@ jobs:
             --attempts "${{ inputs.attempts }}" \
             --delay-min "${{ inputs.delay_min }}" \
             --delay-max "${{ inputs.delay_max }}"
+      - name: upload raw pages immediately
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: doc-pages-explicit-${{ github.run_id }}-${{ matrix.i }}-raw
+          path: |
+            out/*.png
+            out/pages_manifest.csv
+            out/failed_pages.csv
+            out/doc_status.csv
+            out/pages_summary.json
+          retention-days: 30
+          if-no-files-found: warn
+
       - name: extract deed-body buyer/seller intelligence
         if: always()
         run: |
