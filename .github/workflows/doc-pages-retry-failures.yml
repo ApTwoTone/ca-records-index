@@ -133,37 +133,6 @@ jobs:
         with:
           name: retry-doc-page-lists-${{ inputs.source_page_run_id }}
           path: doclists
-      - name: download prior page artifacts for resume seed
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p prior_artifacts
-          gh run download "${{ inputs.source_page_run_id }}" -R "${{ github.repository }}" -D prior_artifacts
-      - name: seed already fetched pages for shard ${{ matrix.i }}
-        run: |
-          mkdir -p out
-          python3 - <<'PY'
-          from pathlib import Path
-          import re, shutil
-          docs = {
-              line.strip()
-              for line in Path("doclists/retry_doclist_${{ matrix.i }}.txt").read_text(encoding="utf-8").splitlines()
-              if line.strip()
-          }
-          copied = 0
-          seen = set()
-          for path in Path("prior_artifacts").rglob("*.png"):
-              match = re.match(r"(\d+)_p?(\d+)\.png$", path.name, re.I)
-              if not match or match.group(1) not in docs:
-                  continue
-              dest = Path("out") / path.name
-              if dest in seen or dest.exists():
-                  continue
-              shutil.copy2(path, dest)
-              seen.add(dest)
-              copied += 1
-          print(f"seeded_existing_pages={copied}")
-          PY
       - name: pull retry pages for shard ${{ matrix.i }}
         timeout-minutes: 28
         env:
