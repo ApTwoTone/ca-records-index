@@ -117,6 +117,7 @@ jobs:
     needs: plan
     if: ${{ needs.plan.outputs.doc_count != '0' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       max-parallel: 20
