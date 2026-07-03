@@ -20,6 +20,7 @@ on:
       delay_min: { required: false, type: string, default: "8.0" }
       delay_max: { required: false, type: string, default: "12.0" }
       attempts: { required: false, type: string, default: "8" }
+      metadata_fallback: { required: false, type: string, default: "false" }
 
 permissions:
   actions: read
@@ -45,6 +46,7 @@ jobs:
       - id: gen
         env:
           DOC_NOS: ${{ inputs.doc_nos }}
+          METADATA_FALLBACK: ${{ inputs.metadata_fallback }}
         run: |
           mkdir -p doclists
           python3 - "${{ inputs.shards }}" <<'PY' >> "$GITHUB_OUTPUT"
@@ -96,24 +98,28 @@ jobs:
                           add_meta(doc, row)
 
           missing = [doc for doc in docs if doc not in meta]
-          if missing:
+          metadata_fallback = os.environ.get("METADATA_FALLBACK", "").strip().lower() in {"1", "true", "yes", "on"}
+          if missing and metadata_fallback:
               idx.THROTTLE = (3.0, 5.0)
               idx.RETRIES = 4
-          for doc in missing:
-              try:
-                  res = idx.fetch(doc, save_evidence=False)
-              except Exception as exc:
-                  res = {"ok": False, "reason": f"{type(exc).__name__}:{exc}"}
-              row = {
-                  "doc_no": doc,
-                  "ain": res.get("ain") or "",
-                  "record_date": res.get("record_date") or "",
-                  "county_type": res.get("county_type") or "",
-                  "grantors": json.dumps(res.get("grantors") or []),
-                  "grantees": json.dumps(res.get("grantees") or []),
-                  "lead_class": "",
-              }
-              add_meta(doc, row)
+              for doc in missing:
+                  try:
+                      res = idx.fetch(doc, save_evidence=False)
+                  except Exception as exc:
+                      res = {"ok": False, "reason": f"{type(exc).__name__}:{exc}"}
+                  row = {
+                      "doc_no": doc,
+                      "ain": res.get("ain") or "",
+                      "record_date": res.get("record_date") or "",
+                      "county_type": res.get("county_type") or "",
+                      "grantors": json.dumps(res.get("grantors") or []),
+                      "grantees": json.dumps(res.get("grantees") or []),
+                      "lead_class": "",
+                  }
+                  add_meta(doc, row)
+          else:
+              for doc in missing:
+                  add_meta(doc, {"doc_no": doc})
 
           with open("doclists/doc_metadata.csv", "w", newline="", encoding="utf-8") as fh:
               fields = ["doc_no", "ain", "record_date", "county_type", "grantors", "grantees", "lead_class"]
