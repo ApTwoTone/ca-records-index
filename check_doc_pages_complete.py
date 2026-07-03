@@ -33,6 +33,7 @@ def main() -> int:
     failed_pages = count_csv_rows(outdir / "failed_pages.csv")
     status_rows = []
     status_path = outdir / "doc_status.csv"
+    status_present = status_path.exists()
     if status_path.exists():
         with status_path.open(newline="", encoding="utf-8") as fh:
             status_rows = list(csv.DictReader(fh))
@@ -41,11 +42,13 @@ def main() -> int:
         row for row in status_rows
         if (row.get("status") or "").strip() not in COMPLETE_DOC_STATUSES
     ]
-    ok = failed_pages == 0 and not incomplete_docs
+    has_status_proof = status_present and len(status_rows) > 0
+    ok = has_status_proof and failed_pages == 0 and not incomplete_docs
     payload = {
         "ok": ok,
         "outdir": str(outdir),
         "failed_pages": failed_pages,
+        "doc_status_present": status_present,
         "doc_status_rows": len(status_rows),
         "doc_status_counts": dict(status_counts),
         "incomplete_docs": len(incomplete_docs),

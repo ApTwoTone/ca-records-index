@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_page_run_id: { required: true, type: string }
-      pages: { required: false, type: string, default: "25" }
+      pages: { required: false, type: string, default: "80" }
       shards: { required: false, type: string, default: "4" }
       delay_min: { required: false, type: string, default: "5.0" }
       delay_max: { required: false, type: string, default: "7.0" }
@@ -32,7 +32,9 @@ jobs:
         run: |
           python3 - "${{ inputs.shards }}" <<'PY' >> "$GITHUB_OUTPUT"
           import csv, glob, json, sys
-          complete = {"done", "no_pages"}
+          # `no_pages` is retryable for NETR image pulls. A valid recorder doc
+          # must produce at least one page or it stays in the retry queue.
+          complete = {"done"}
           shards = max(1, int(sys.argv[1]))
           docs = []
           seen = set()
@@ -171,6 +173,12 @@ jobs:
             --attempts "${{ inputs.attempts }}" \
             --delay-min "${{ inputs.delay_min }}" \
             --delay-max "${{ inputs.delay_max }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: doc-pages-retry-${{ inputs.source_page_run_id }}-${{ matrix.i }}-raw
+          path: out/
+          retention-days: 30
       - name: extract deed-body buyer/seller intelligence
         if: always()
         run: |
