@@ -8,6 +8,7 @@ on:
       doc_end:   { required: true,  type: string }
       shards:    { required: true,  type: string, default: "18" }
       conc:      { required: false, type: string, default: "6" }
+      doc_ids_b64: { required: false, type: string, default: "" }
 
 jobs:
   plan:
@@ -18,19 +19,36 @@ jobs:
     steps:
       - id: gen
         run: |
-          python3 - "$DOC_START" "$DOC_END" "$SHARDS" <<'PY' >> "$GITHUB_OUTPUT"
-          import sys, json
+          python3 - "$DOC_START" "$DOC_END" "$SHARDS" "$DOC_IDS_B64" <<'PY' >> "$GITHUB_OUTPUT"
+          import sys, json, base64, gzip
           s, e, n = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
-          total = e - s + 1
-          per = -(-total // n)
-          shards = [{"i": i, "start": s + i*per, "end": min(e, s + (i+1)*per - 1)}
-                    for i in range(n) if s + i*per <= e]
+          encoded = sys.argv[4].strip()
+          if encoded:
+              docs = [int(x) for x in gzip.decompress(base64.b64decode(encoded)).decode().splitlines() if x]
+              if not docs:
+                  raise SystemExit("doc_ids_b64 decoded to an empty list")
+              per = -(-len(docs) // n)
+              shards = []
+              for i in range(n):
+                  part = docs[i*per:(i+1)*per]
+                  if not part:
+                      continue
+                  payload = base64.b64encode(gzip.compress(("\n".join(map(str, part))+"\n").encode())).decode()
+                  shards.append({"i": i, "start": part[0], "end": part[-1],
+                                 "docs_b64": payload, "doc_count": len(part)})
+          else:
+              total = e - s + 1
+              per = -(-total // n)
+              shards = [{"i": i, "start": s + i*per, "end": min(e, s + (i+1)*per - 1),
+                         "docs_b64": "", "doc_count": min(e, s + (i+1)*per - 1) - (s + i*per) + 1}
+                        for i in range(n) if s + i*per <= e]
           print("matrix=" + json.dumps({"include": shards}))
           PY
         env:
           DOC_START: ${{ inputs.doc_start }}
           DOC_END:   ${{ inputs.doc_end }}
           SHARDS:    ${{ inputs.shards }}
+          DOC_IDS_B64: ${{ inputs.doc_ids_b64 }}
 
   harvest:
     needs: plan
@@ -49,10 +67,12 @@ jobs:
           SHARD: ${{ matrix.i }}
           DOC_START: ${{ matrix.start }}
           DOC_END: ${{ matrix.end }}
+          DOCS_B64: ${{ matrix.docs_b64 }}
+          DOC_COUNT: ${{ matrix.doc_count }}
         run: |
           mkdir -p out
           python3 - <<'PY'
-          import datetime, json, os, urllib.request
+          import base64, datetime, gzip, hashlib, json, os, urllib.request
           public_ip = None
           try:
               req = urllib.request.Request(
@@ -74,6 +94,12 @@ jobs:
               "shard": int(os.environ["SHARD"]),
               "doc_start": os.environ["DOC_START"],
               "doc_end": os.environ["DOC_END"],
+              "exact_doc_count": int(os.environ["DOC_COUNT"]),
+              "exact_docs_sha256": hashlib.sha256(
+                  gzip.decompress(base64.b64decode(os.environ["DOCS_B64"]))
+                  if os.environ.get("DOCS_B64") else
+                  ("\n".join(str(x) for x in range(int(os.environ["DOC_START"]), int(os.environ["DOC_END"])+1))+"\n").encode()
+              ).hexdigest(),
               "public_egress_ip": public_ip,
               "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "contains_secrets": False,
@@ -83,9 +109,20 @@ jobs:
           PY
       - name: harvest shard ${{ matrix.i }}  (${{ matrix.start }}..${{ matrix.end }})
         timeout-minutes: 24
+        env:
+          DOCS_B64: ${{ matrix.docs_b64 }}
         run: |
-          python3 harvest_index_shard.py ${{ matrix.start }} ${{ matrix.end }} \
-            out/shard_${{ matrix.i }}.csv --conc ${{ inputs.conc }}
+          if [ -n "$DOCS_B64" ]; then
+            python3 - <<'PY'
+          import base64, gzip, os
+          open("out/exact_doc_ids.txt", "wb").write(gzip.decompress(base64.b64decode(os.environ["DOCS_B64"])))
+          PY
+            python3 harvest_index_shard.py ${{ matrix.start }} ${{ matrix.end }} \
+              out/shard_${{ matrix.i }}.csv --conc ${{ inputs.conc }} --doc-file out/exact_doc_ids.txt
+          else
+            python3 harvest_index_shard.py ${{ matrix.start }} ${{ matrix.end }} \
+              out/shard_${{ matrix.i }}.csv --conc ${{ inputs.conc }}
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:

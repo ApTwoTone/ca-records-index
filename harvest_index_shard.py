@@ -14,7 +14,7 @@ Usage:
 
 CSV columns: doc_no,ok,county_type,record_date,grantors,grantees,ain,lead_class,reason
 """
-import sys, os, csv, time, threading, queue, argparse, collections
+import sys, os, csv, time, threading, queue, argparse, collections, random
 
 # Reach the modules whether run from repo root or elsewhere.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +37,27 @@ idx.THROTTLE = (
 idx.RETRIES = 3
 
 THROTTLE_MARKERS = ("too many searches", "please wait a moment")
+RATE_LOCK = threading.Lock()
+NEXT_REQUEST_AT = 0.0
+
+
+def _pace_request():
+    """Enforce one aggregate request cadence per runner/IP.
+
+    The old delay lived inside each worker.  With ``--conc 6`` that multiplied
+    a nominal 18 requests/minute into roughly 108 requests/minute and caused
+    NETR's HTTP-200 soft rate wall.  Threads may still overlap parsing and
+    backoff, but request starts share this single per-process clock.
+    """
+    global NEXT_REQUEST_AT
+    low = float(os.environ.get("NETR_REQUEST_FLOOR_MIN", "2.9"))
+    high = float(os.environ.get("NETR_REQUEST_FLOOR_MAX", "3.5"))
+    with RATE_LOCK:
+        now = time.monotonic()
+        wait = max(0.0, NEXT_REQUEST_AT - now)
+        NEXT_REQUEST_AT = max(now, NEXT_REQUEST_AT) + random.uniform(low, high)
+    if wait:
+        time.sleep(wait)
 
 
 def _is_throttled(res):
@@ -49,10 +70,10 @@ def fetch_resilient(doc, max_wall_retries=6, max_wall_budget=40.0):
     """idx.fetch + detection of the soft 'Too many searches' rate-wall (HTTP 200
     body). SHALLOW backoff: cap total per-doc backoff so one persistently-walled
     doc can't stall the whole shard (the 9-deep version did exactly that)."""
-    import random
     delay = 1.5
     spent = 0.0
     for attempt in range(max_wall_retries):
+        _pace_request()
         res = idx.fetch(str(doc), save_evidence=False)
         if res.get("ok") or not _is_throttled(res):
             return res
@@ -64,9 +85,9 @@ def fetch_resilient(doc, max_wall_retries=6, max_wall_budget=40.0):
     return res
 
 
-def harvest(doc_start, doc_end, out_csv, conc):
+def harvest_docs(docs, out_csv, conc):
     jobs = queue.Queue()
-    for d in range(doc_start, doc_end + 1):
+    for d in dict.fromkeys(int(x) for x in docs):
         jobs.put(d)
     total = jobs.qsize()
     stats = collections.Counter()
@@ -121,14 +142,26 @@ def harvest(doc_start, doc_end, out_csv, conc):
           (total, el / 60, total / el * 60, dict(stats)), flush=True)
 
 
+def harvest(doc_start, doc_end, out_csv, conc):
+    harvest_docs(range(doc_start, doc_end + 1), out_csv, conc)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("doc_start", type=int)
     ap.add_argument("doc_end", type=int)
     ap.add_argument("out_csv")
     ap.add_argument("--conc", type=int, default=2)
+    ap.add_argument("--doc-file", help="newline-delimited exact document IDs")
     a = ap.parse_args()
-    harvest(a.doc_start, a.doc_end, a.out_csv, a.conc)
+    if a.doc_file:
+        with open(a.doc_file, encoding="utf-8") as fh:
+            docs = [line.strip() for line in fh if line.strip()]
+        if not docs:
+            ap.error("--doc-file is empty")
+        harvest_docs(docs, a.out_csv, a.conc)
+    else:
+        harvest(a.doc_start, a.doc_end, a.out_csv, a.conc)
 
 
 if __name__ == "__main__":
