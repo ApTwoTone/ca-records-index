@@ -1,11 +1,6 @@
 name: index-fanout
 # STAGE 2: distributed harvest of the LA recorder INDEX (POST /lasearch) across
-# N GitHub-hosted runners. Each runner = its own Azure IP = its own NETR per-IP
-# budget. Authoritative type + grantor/grantee names + AIN as tiny CSV text.
-# RESEARCH over PUBLIC records only.
-#
-# Run:
-#   gh workflow run index-fanout.yml -f doc_start=20260438605 -f doc_end=20260449202 -f shards=18
+# N GitHub-hosted runners. RESEARCH over PUBLIC records only.
 on:
   workflow_dispatch:
     inputs:
@@ -27,7 +22,7 @@ jobs:
           import sys, json
           s, e, n = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
           total = e - s + 1
-          per = -(-total // n)   # ceil
+          per = -(-total // n)
           shards = [{"i": i, "start": s + i*per, "end": min(e, s + (i+1)*per - 1)}
                     for i in range(n) if s + i*per <= e]
           print("matrix=" + json.dumps({"include": shards}))
@@ -49,10 +44,46 @@ jobs:
       - uses: actions/checkout@v4
       - name: install curl_cffi
         run: pip install --quiet curl_cffi
+      - name: record runner identity and public egress
+        env:
+          SHARD: ${{ matrix.i }}
+          DOC_START: ${{ matrix.start }}
+          DOC_END: ${{ matrix.end }}
+        run: |
+          mkdir -p out
+          python3 - <<'PY'
+          import datetime, json, os, urllib.request
+          public_ip = None
+          try:
+              req = urllib.request.Request(
+                  "https://api.ipify.org?format=json",
+                  headers={"User-Agent": "zoar-netr-runner-receipt/1.0"},
+              )
+              with urllib.request.urlopen(req, timeout=10) as response:
+                  public_ip = json.loads(response.read().decode())["ip"]
+          except Exception:
+              public_ip = None
+          receipt = {
+              "repository": os.environ.get("GITHUB_REPOSITORY"),
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "job": os.environ.get("GITHUB_JOB"),
+              "runner_name": os.environ.get("RUNNER_NAME"),
+              "runner_os": os.environ.get("RUNNER_OS"),
+              "runner_arch": os.environ.get("RUNNER_ARCH"),
+              "shard": int(os.environ["SHARD"]),
+              "doc_start": os.environ["DOC_START"],
+              "doc_end": os.environ["DOC_END"],
+              "public_egress_ip": public_ip,
+              "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "contains_secrets": False,
+          }
+          with open(f"out/runner_identity_{receipt['shard']}.json", "w") as fh:
+              json.dump(receipt, fh, indent=2, sort_keys=True)
+          PY
       - name: harvest shard ${{ matrix.i }}  (${{ matrix.start }}..${{ matrix.end }})
         timeout-minutes: 24
         run: |
-          mkdir -p out
           python3 harvest_index_shard.py ${{ matrix.start }} ${{ matrix.end }} \
             out/shard_${{ matrix.i }}.csv --conc ${{ inputs.conc }}
       - uses: actions/upload-artifact@v4
@@ -62,4 +93,4 @@ jobs:
           path: out/
           retention-days: 3
 
-# trigger registration
+# runner identity receipts contain no credentials or private record data.
