@@ -13,6 +13,7 @@ import sys, csv
 PROPERTY_BEARING = {
     "notice_of_default", "notice_of_trustees_sale", "trustees_deed_upon_sale",
     "affidavit_death", "affidavit_death_unspecified",
+    "affidavit_successor_trustee", "affidavit_succession_interest",
     "revocable_transfer_death_deed", "decree_distribution_probate",
     "abstract_of_judgment", "tax_lien", "mechanics_lien", "hoa_lien",
     "lis_pendens",

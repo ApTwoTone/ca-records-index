@@ -9,7 +9,9 @@ CERTIFICATION, REQUEST FOR NOTICE, RESCISSION) stay authoritative.
 
 Returns a single snake_case lead_class string from the union vocabulary:
   notice_of_default, notice_of_trustees_sale, trustees_deed_upon_sale,
-  affidavit_death, revocable_transfer_death_deed, decree_distribution_probate,
+  affidavit_death, affidavit_successor_trustee,
+  affidavit_succession_interest, revocable_transfer_death_deed,
+  decree_distribution_probate,
   abstract_of_judgment, tax_lien, mechanics_lien, interspousal_transfer,
   dissolution_marriage, lis_pendens, hoa_lien, code_enforcement,
   (plus pass-through: rescission, request_for_notice, substitution_of_trustee,
@@ -39,6 +41,7 @@ def _norm(s: Optional[str]) -> str:
 # BEFORE these run, so these only see non-foreclosure types.
 _RULES = [
     ("revocable_transfer_death_deed", [
+        r"^REVOCABLE\s+TRANSFER\s+(?:ON\s+)?DEATH\s+DEED$",
         r"\bREVOCABLE\s+TRANSFER\s+ON\s+DEATH\b",
         r"\bTRANSFER\s+ON\s+DEATH\b",
         r"\bREV\s+TRANS\s+DEATH\b",
@@ -50,13 +53,21 @@ _RULES = [
         r"\bDEATH\s+OF\s+(JOINT\s+TENANT|TRUSTEE|SPOUSE|GRANTOR)\b",
         r"\bSPOUSAL\s+PROPERTY\b.*\bDEATH\b",
     ]),
+    # These are distinct LA recorder estate-transfer instruments. Keep the
+    # matches exact so generic successor-trustee and succession documents do
+    # not enter the AOD lane.
+    ("affidavit_successor_trustee", [
+        r"^AFFIDAVIT\s+SUCCESSOR\s+TRUSTEE$",
+    ]),
+    ("affidavit_succession_interest", [
+        r"^AFFIDAVIT\s+SUCCESSION\s+INTEREST$",
+    ]),
     # Bare "AFFIDAVIT" with no qualifier: in the LA recorder index the
     # overwhelming majority of bare affidavits are Affidavits of Death (estate
     # transfer signal). Surface as affidavit_death_unspecified so it is captured
     # as a probable estate lead but kept distinct from confirmed-death affidavits.
     ("affidavit_death_unspecified", [
         r"^AFFIDAVIT$",
-        r"^AFFIDAVIT\s+OF\b",
     ]),
     ("decree_distribution_probate", [
         r"\bDECREE\b",
