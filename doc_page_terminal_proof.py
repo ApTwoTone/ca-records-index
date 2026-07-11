@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 from collections import Counter
 from pathlib import Path
 
@@ -94,6 +95,7 @@ def validate_artifact_dir(outdir: Path) -> dict[str, object]:
         if truthy(row.get("terminal") or ""):
             terminal_by_doc.setdefault((row.get("doc_no") or "").strip(), []).append(row)
     proven: set[str] = set()
+    proof_records: list[dict[str, str]] = []
     errors: list[dict[str, str]] = []
     for status_row in status_rows:
         doc = (status_row.get("doc_no") or "").strip()
@@ -141,6 +143,14 @@ def validate_artifact_dir(outdir: Path) -> dict[str, object]:
             errors.append({"doc_no": doc, "reason": "manifest/evidence terminal mismatch"})
             continue
         proven.add(doc)
+        proof_records.append({
+            key: (valid[0].get(key) or "").strip()
+            for key in (
+                "doc_no", "page", "event", "upstream_status", "candidate_bytes",
+                "candidate_body_sha256", "candidate_pixel_sha256", "matched_page",
+                "matched_body_sha256", "matched_pixel_sha256",
+            )
+        })
     done = {
         (row.get("doc_no") or "").strip() for row in status_rows
         if (row.get("status") or "").strip() == "done"
@@ -153,6 +163,7 @@ def validate_artifact_dir(outdir: Path) -> dict[str, object]:
         "terminal_evidence_rows": len(evidence_rows),
         "done_docs": sorted(done),
         "proven_docs": sorted(proven),
+        "proof_records": proof_records,
         "errors": errors,
     }
 
@@ -164,13 +175,24 @@ def validate_artifact_root(root: Path, requested_docs: set[str]) -> dict[str, ob
         candidates = raw
     proven: set[str] = set()
     errors: list[dict[str, str]] = []
+    proof_records: dict[str, dict[str, str]] = {}
     artifact_summaries = []
     for manifest in candidates:
         summary = validate_artifact_dir(manifest.parent)
         artifact_summaries.append({"path": str(manifest.parent), **summary})
         proven.update(set(summary["proven_docs"]) & requested_docs)
+        for record in summary["proof_records"]:
+            if record["doc_no"] in requested_docs:
+                proof_records[record["doc_no"]] = record
         errors.extend(summary["errors"])
     missing = sorted(requested_docs - proven)
+    proof_inventory_sha256 = hashlib.sha256(
+        json.dumps(
+            [proof_records[key] for key in sorted(proof_records)],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     return {
         "complete": bool(candidates) and not missing,
         "requested_docs": len(requested_docs),
@@ -178,5 +200,6 @@ def validate_artifact_root(root: Path, requested_docs: set[str]) -> dict[str, ob
         "missing_docs": missing,
         "artifact_dirs": len(candidates),
         "proof_errors": errors,
+        "proof_inventory_sha256": proof_inventory_sha256,
         "artifact_summaries": artifact_summaries,
     }
