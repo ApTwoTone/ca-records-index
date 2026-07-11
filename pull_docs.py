@@ -36,6 +36,11 @@ UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML,
 CTX = ssl.create_default_context()
 
 
+def flattened_pixels(image: Image.Image) -> list[int]:
+    getter = getattr(image, "get_flattened_data", None)
+    return list(getter() if getter else image.getdata())
+
+
 def now_utc() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -67,9 +72,9 @@ def page_fingerprint_bytes(body: bytes) -> dict[str, int | str]:
             pixel_sha256 = hashlib.sha256(
                 f"{rgb.width}x{rgb.height}:RGB:".encode("ascii") + rgb.tobytes()
             ).hexdigest()
-            ink_pixels = sum(1 for pixel in gray.getdata() if pixel < 245)
+            ink_pixels = sum(1 for pixel in flattened_pixels(gray) if pixel < 245)
             small = gray.resize((16, 16))
-            pixels = list(small.getdata())
+            pixels = flattened_pixels(small)
             avg = sum(pixels) / len(pixels)
             bits = 0
             for pixel in pixels:
