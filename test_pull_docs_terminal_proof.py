@@ -55,6 +55,28 @@ class FingerprintTests(unittest.TestCase):
         fp = pull_docs.page_fingerprint_bytes(png_bytes(blank))
         self.assertFalse(pull_docs.is_substantive_page(fp))
 
+    def test_fetch_exhausts_all_attempts_before_empty_png_status(self):
+        class EmptyPngResponse:
+            status = 200
+            headers = {"X-Upstream-Status": "200", "Content-Type": "image/png"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                return b""
+
+        with mock.patch.object(
+            pull_docs.urllib.request, "urlopen", side_effect=lambda *_a, **_k: EmptyPngResponse()
+        ) as opened, mock.patch.object(pull_docs.time, "sleep"):
+            result = pull_docs.fetch_page("key", "20260000000", 3, 8)
+        self.assertEqual(result, ("empty_png_exhausted", b"", "200", "image/png", 8))
+        self.assertEqual(opened.call_count, 8)
+
 
 class CompletionProofTests(unittest.TestCase):
     def write_csv(self, path: Path, fields: list[str], rows: list[dict[str, object]]) -> None:
@@ -141,9 +163,9 @@ class CompletionProofTests(unittest.TestCase):
             first_body = png_bytes(first)
             second_body = png_bytes(second)
             responses = iter([
-                ("ok", first_body, "200", "image/png"),
-                ("ok", second_body, "200", "image/png"),
-                ("ok", second_body, "200", "image/png"),
+                ("ok", first_body, "200", "image/png", 1),
+                ("ok", second_body, "200", "image/png", 1),
+                ("ok", second_body, "200", "image/png", 1),
             ])
             argv = [
                 "pull_docs.py", str(doclist), str(out), "--max-pages", "8",
@@ -173,8 +195,8 @@ class CompletionProofTests(unittest.TestCase):
             body = png_bytes(page)
             end_body = b"upstream recorder page index ended"
             responses = iter([
-                ("ok", body, "200", "image/png"),
-                ("end", end_body, "500", "text/plain"),
+                ("ok", body, "200", "image/png", 1),
+                ("end", end_body, "500", "text/plain", 1),
             ])
             argv = [
                 "pull_docs.py", str(doclist), str(out), "--max-pages", "8",
@@ -191,6 +213,93 @@ class CompletionProofTests(unittest.TestCase):
             candidate = out / evidence[-1]["candidate_path"]
             self.assertEqual(candidate.read_bytes(), end_body)
             self.assertEqual(self.run_checker(out).returncode, 0)
+
+    def test_two_exhausted_consecutive_empty_png_pages_are_proven_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doclist = root / "docs.txt"
+            doclist.write_text("20260000004\n", encoding="utf-8")
+            out = root / "out"
+            page1 = Image.new("RGB", (512, 700), "white")
+            ImageDraw.Draw(page1).text((50, 50), "PAGE ONE", fill="black")
+            page2 = page1.copy()
+            ImageDraw.Draw(page2).text((50, 100), "PAGE TWO", fill="black")
+            responses = iter([
+                ("ok", png_bytes(page1), "200", "image/png", 1),
+                ("ok", png_bytes(page2), "200", "image/png", 1),
+                ("empty_png_exhausted", b"", "200", "image/png", 8),
+                ("empty_png_exhausted", b"", "200", "image/png", 8),
+            ])
+            argv = [
+                "pull_docs.py", str(doclist), str(out), "--max-pages", "8",
+                "--attempts", "8", "--delay-min", "0", "--delay-max", "0",
+            ]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pull_docs, "read_key", return_value="test"), \
+                    mock.patch.object(pull_docs, "fetch_page", side_effect=lambda *_: next(responses)):
+                self.assertEqual(pull_docs.main(), 0)
+            with (out / "terminal_evidence.csv").open(newline="", encoding="utf-8") as handle:
+                evidence = list(csv.DictReader(handle))
+            empty_events = [row["event"] for row in evidence if "empty" in row["event"]]
+            self.assertEqual(empty_events, [
+                "exact_empty_png_probe_not_terminal", "exact_empty_repeat_end",
+            ])
+            self.assertEqual(evidence[-1]["matched_page"], "3")
+            self.assertEqual(evidence[-1]["attempts_exhausted"], "8")
+            self.assertEqual(self.run_checker(out).returncode, 0)
+            evidence[-1]["attempts_exhausted"] = "7"
+            self.write_csv(out / "terminal_evidence.csv", pull_docs.EVIDENCE_FIELDS, evidence)
+            self.assertEqual(self.run_checker(out).returncode, 1)
+
+    def test_single_empty_png_is_nonterminal_and_fails_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doclist = root / "docs.txt"
+            doclist.write_text("20260000005\n", encoding="utf-8")
+            out = root / "out"
+            page = Image.new("RGB", (512, 700), "white")
+            ImageDraw.Draw(page).text((50, 50), "PAGE", fill="black")
+            body = png_bytes(page)
+            responses = iter([
+                ("ok", body, "200", "image/png", 1),
+                ("empty_png_exhausted", b"", "200", "image/png", 8),
+                ("end", b"", "500", "text/plain", 1),
+            ])
+            argv = [
+                "pull_docs.py", str(doclist), str(out), "--max-pages", "3",
+                "--attempts", "8", "--delay-min", "0", "--delay-max", "0",
+            ]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pull_docs, "read_key", return_value="test"), \
+                    mock.patch.object(pull_docs, "fetch_page", side_effect=lambda *_: next(responses)):
+                self.assertEqual(pull_docs.main(), 0)
+            self.assertEqual(self.run_checker(out).returncode, 1)
+            with (out / "failed_pages.csv").open(newline="", encoding="utf-8") as handle:
+                failed = list(csv.DictReader(handle))
+            self.assertEqual(failed[0]["status"], "empty_png_unconfirmed")
+
+    def test_empty_png_without_prior_valid_page_never_terminates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doclist = root / "docs.txt"
+            doclist.write_text("20260000006\n", encoding="utf-8")
+            out = root / "out"
+            responses = iter([
+                ("empty_png_exhausted", b"", "200", "image/png", 8),
+                ("empty_png_exhausted", b"", "200", "image/png", 8),
+            ])
+            argv = [
+                "pull_docs.py", str(doclist), str(out), "--max-pages", "2",
+                "--attempts", "8", "--delay-min", "0", "--delay-max", "0",
+            ]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pull_docs, "read_key", return_value="test"), \
+                    mock.patch.object(pull_docs, "fetch_page", side_effect=lambda *_: next(responses)):
+                self.assertEqual(pull_docs.main(), 0)
+            self.assertEqual(self.run_checker(out).returncode, 1)
+            with (out / "terminal_evidence.csv").open(newline="", encoding="utf-8") as handle:
+                evidence = list(csv.DictReader(handle))
+            self.assertFalse(any(row["terminal"] == "true" for row in evidence))
 
 
 if __name__ == "__main__":

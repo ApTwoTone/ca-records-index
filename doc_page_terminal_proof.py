@@ -28,6 +28,7 @@ def _valid_evidence(
     doc: str,
     evidence: dict[str, str],
     page_paths: dict[tuple[str, int], Path],
+    all_evidence: list[dict[str, str]],
 ) -> tuple[bool, str]:
     event = (evidence.get("event") or "").strip()
     upstream = (evidence.get("upstream_status") or "").strip()
@@ -45,6 +46,57 @@ def _valid_evidence(
             if hashlib.sha256(candidate.read_bytes()).hexdigest() != evidence.get("candidate_body_sha256"):
                 return False, "upstream-end response hash mismatch"
         return True, ""
+    if event == "exact_empty_repeat_end":
+        empty_sha = hashlib.sha256(b"").hexdigest()
+        try:
+            terminal_page = int(evidence.get("page") or "0")
+            matched_page = int(evidence.get("matched_page") or "0")
+            attempts = int(evidence.get("attempts_exhausted") or "0")
+        except ValueError:
+            return False, "invalid repeated-empty proof numbers"
+        content_type = (evidence.get("content_type") or "").lower().split(";", 1)[0].strip()
+        candidate = outdir / (evidence.get("candidate_path") or "")
+        if not (
+            evidence.get("upstream_status") == "200"
+            and content_type == "image/png"
+            and evidence.get("candidate_bytes") == "0"
+            and evidence.get("candidate_body_sha256") == empty_sha
+            and evidence.get("matched_body_sha256") == empty_sha
+            and attempts >= 8
+            and matched_page > 0
+            and terminal_page == matched_page + 1
+            and candidate.is_file()
+            and candidate.stat().st_size == 0
+            and hashlib.sha256(candidate.read_bytes()).hexdigest() == empty_sha
+        ):
+            return False, "terminal empty-PNG response proof is incomplete"
+        probes = [
+            row for row in all_evidence
+            if (row.get("doc_no") or "").strip() == doc
+            and (row.get("event") or "").strip() == "exact_empty_png_probe_not_terminal"
+            and (row.get("page") or "").strip() == str(matched_page)
+        ]
+        if len(probes) != 1:
+            return False, "missing/ambiguous preceding empty-PNG probe"
+        probe = probes[0]
+        try:
+            probe_attempts = int(probe.get("attempts_exhausted") or "0")
+        except ValueError:
+            return False, "invalid preceding empty-PNG attempt count"
+        probe_type = (probe.get("content_type") or "").lower().split(";", 1)[0].strip()
+        probe_path = outdir / (probe.get("candidate_path") or "")
+        valid_probe = (
+            probe.get("terminal") == "false"
+            and probe.get("upstream_status") == "200"
+            and probe_type == "image/png"
+            and probe.get("candidate_bytes") == "0"
+            and probe.get("candidate_body_sha256") == empty_sha
+            and probe_attempts >= 8
+            and probe_path.is_file()
+            and probe_path.stat().st_size == 0
+            and hashlib.sha256(probe_path.read_bytes()).hexdigest() == empty_sha
+        )
+        return valid_probe, "preceding empty-PNG probe is incomplete"
     if event not in {"exact_byte_duplicate", "exact_pixel_duplicate"}:
         return False, f"unsupported terminal event {event or 'missing'}"
     try:
@@ -116,7 +168,9 @@ def validate_artifact_dir(outdir: Path) -> dict[str, object]:
         valid: list[dict[str, str]] = []
         reasons = []
         for evidence in terminal_by_doc.get(doc, []):
-            accepted, reason = _valid_evidence(outdir, doc, evidence, page_paths)
+            accepted, reason = _valid_evidence(
+                outdir, doc, evidence, page_paths, evidence_rows
+            )
             if accepted:
                 valid.append(evidence)
             else:
@@ -128,7 +182,9 @@ def validate_artifact_dir(outdir: Path) -> dict[str, object]:
             })
             continue
         terminal_page = int(valid[0].get("page") or "0")
-        if terminal_page != max(ok_pages) + 1:
+        empty_repeat = valid[0].get("event") == "exact_empty_repeat_end"
+        expected_terminal_page = max(ok_pages) + (2 if empty_repeat else 1)
+        if terminal_page != expected_terminal_page:
             errors.append({"doc_no": doc, "reason": "terminal is not immediately after last page"})
             continue
         terminal_manifest = []
@@ -138,7 +194,18 @@ def validate_artifact_dir(outdir: Path) -> dict[str, object]:
                     terminal_manifest.append(row)
             except ValueError:
                 pass
-        expected = "end" if valid[0].get("event") == "upstream_500_end" else "duplicate_end"
+        if empty_repeat:
+            probe_manifest = [
+                row for row in rows
+                if (row.get("page") or "").strip() == str(max(ok_pages) + 1)
+                and row.get("status") == "empty_png_probe"
+            ]
+            if len(probe_manifest) != 1:
+                errors.append({"doc_no": doc, "reason": "missing empty-PNG probe manifest"})
+                continue
+            expected = "empty_png_end"
+        else:
+            expected = "end" if valid[0].get("event") == "upstream_500_end" else "duplicate_end"
         if len(terminal_manifest) != 1 or terminal_manifest[0].get("status") != expected:
             errors.append({"doc_no": doc, "reason": "manifest/evidence terminal mismatch"})
             continue
@@ -148,7 +215,8 @@ def validate_artifact_dir(outdir: Path) -> dict[str, object]:
             for key in (
                 "doc_no", "page", "event", "upstream_status", "candidate_bytes",
                 "candidate_body_sha256", "candidate_pixel_sha256", "matched_page",
-                "matched_body_sha256", "matched_pixel_sha256",
+                "matched_body_sha256", "matched_pixel_sha256", "content_type",
+                "attempts_exhausted",
             )
         })
     done = {

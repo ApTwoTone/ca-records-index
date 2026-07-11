@@ -145,8 +145,9 @@ def is_substantive_page(fingerprint: dict[str, int | str]) -> bool:
 
 def fetch_page(
     key: str, doc_no: str, page: int, attempts: int
-) -> tuple[str, bytes | None, str, str]:
+) -> tuple[str, bytes | None, str, str, int]:
     url = f"{WORKER}/thumb/{doc_no}/{page}"
+    empty_png = None
     for attempt in range(1, attempts + 1):
         try:
             req = urllib.request.Request(url, headers={"X-Auth": key, "User-Agent": UA})
@@ -155,13 +156,23 @@ def fetch_page(
                 content_type = resp.headers.get("Content-Type", "")
                 body = resp.read()
             if body[:4] == b"\x89PNG" and len(body) > 5000:
-                return "ok", body, upstream, content_type
+                return "ok", body, upstream, content_type, attempt
             if upstream == "500":
-                return "end", body, upstream, content_type
+                return "end", body, upstream, content_type, attempt
+            if (
+                upstream == "200"
+                and content_type.lower().split(";", 1)[0].strip() == "image/png"
+                and len(body) == 0
+            ):
+                empty_png = (body, upstream, content_type, attempt)
+                if attempt < attempts:
+                    time.sleep(min(4.0, 0.5 * attempt) + random.uniform(0, 0.5))
+                    continue
+                break
             if upstream in {"403", "429", "502", "503", "504"}:
                 time.sleep(min(12.0, 1.5 * attempt) + random.uniform(0, 1.5))
                 continue
-            return f"bad_payload_{upstream}", body, upstream, content_type
+            return f"bad_payload_{upstream}", body, upstream, content_type, attempt
         except urllib.error.HTTPError as exc:
             content_type = exc.headers.get("Content-Type", "") if exc.headers else ""
             try:
@@ -169,17 +180,20 @@ def fetch_page(
             except Exception:
                 body = b""
             if exc.code == 500:
-                return "end", body, str(exc.code), content_type
+                return "end", body, str(exc.code), content_type, attempt
             if exc.code in {403, 429, 502, 503, 504}:
                 time.sleep(min(12.0, 1.5 * attempt) + random.uniform(0, 1.5))
                 continue
-            return f"http_{exc.code}", body, str(exc.code), content_type
+            return f"http_{exc.code}", body, str(exc.code), content_type, attempt
         except Exception as exc:
             if attempt < attempts:
                 time.sleep(min(12.0, 1.2 * attempt) + random.uniform(0, 1.0))
                 continue
-            return f"error_{type(exc).__name__}", None, "", ""
-    return "retry_out", None, "", ""
+            return f"error_{type(exc).__name__}", None, "", "", attempt
+    if empty_png is not None:
+        body, upstream, content_type, exhausted = empty_png
+        return "empty_png_exhausted", body, upstream, content_type, exhausted
+    return "retry_out", None, "", "", attempts
 
 
 def read_docs(path: Path) -> list[str]:
@@ -199,7 +213,7 @@ EVIDENCE_FIELDS = [
     "candidate_path", "candidate_bytes", "candidate_body_sha256",
     "candidate_pixel_sha256", "candidate_ink_pixels", "candidate_total_pixels",
     "matched_page", "matched_body_sha256", "matched_pixel_sha256",
-    "ahash_distance", "recorded_at_utc",
+    "ahash_distance", "attempts_exhausted", "recorded_at_utc",
 ]
 
 
@@ -232,6 +246,7 @@ def evidence_row(
     fingerprint: dict[str, int | str] | None = None,
     match: tuple[int, dict[str, int | str], str] | None = None,
     ahash_distance: int | str = "",
+    attempts_exhausted: int | str = "",
 ) -> dict[str, int | str]:
     fingerprint = fingerprint or {}
     matched_page, matched, _kind = match or ("", {}, "")
@@ -254,6 +269,7 @@ def evidence_row(
         "matched_body_sha256": matched.get("body_sha256", ""),
         "matched_pixel_sha256": matched.get("pixel_sha256", ""),
         "ahash_distance": ahash_distance,
+        "attempts_exhausted": attempts_exhausted,
         "recorded_at_utc": now_utc(),
     }
 
@@ -310,10 +326,35 @@ def main() -> int:
             doc_status = "max_pages_reached"
             last_page = 0
             seen_pages: list[tuple[int, dict[str, int | str]]] = []
+            empty_png_run: list[dict[str, object]] = []
+
+            def flush_unconfirmed_empty_png() -> None:
+                nonlocal failed_pages
+                for probe in empty_png_run:
+                    ew.writerow(evidence_row(
+                        doc_no, int(probe["page"]),
+                        "empty_png_unconfirmed_not_terminal", False,
+                        str(probe["upstream"]), str(probe["content_type"]),
+                        str(probe["candidate_path"]), probe["body"],
+                        attempts_exhausted=int(probe["attempts"]),
+                    ))
+                    mw.writerow([
+                        doc_no, probe["page"], "empty_png_unconfirmed",
+                        probe["upstream"], "", 0, now_utc(),
+                    ])
+                    fw.writerow([
+                        doc_no, probe["page"], "empty_png_unconfirmed",
+                        probe["upstream"], now_utc(),
+                    ])
+                    failed_pages += 1
+                empty_png_run.clear()
+
             for page in range(1, args.max_pages + 1):
                 last_page = page
                 out = outdir / f"{doc_no}_{page}.png"
                 if is_valid_png(out):
+                    if empty_png_run:
+                        flush_unconfirmed_empty_png()
                     fingerprint = page_fingerprint_file(out)
                     if not is_substantive_page(fingerprint):
                         ew.writerow(evidence_row(
@@ -355,7 +396,70 @@ def main() -> int:
                     total_pages += 1
                     continue
 
-                status, body, upstream, content_type = fetch_page(key, doc_no, page, args.attempts)
+                status, body, upstream, content_type, attempts_used = fetch_page(
+                    key, doc_no, page, args.attempts
+                )
+                if status == "empty_png_exhausted":
+                    candidate_path = preserve_candidate(
+                        candidate_dir, doc_no, page, "empty_png_exhausted", body, content_type
+                    )
+                    expected_page = pages_ok + len(empty_png_run) + 1
+                    if pages_ok < 1 or page != expected_page:
+                        if empty_png_run:
+                            flush_unconfirmed_empty_png()
+                        empty_png_run.append({
+                            "page": page, "upstream": upstream,
+                            "content_type": content_type, "candidate_path": candidate_path,
+                            "body": body, "attempts": attempts_used,
+                        })
+                        flush_unconfirmed_empty_png()
+                    else:
+                        empty_png_run.append({
+                            "page": page, "upstream": upstream,
+                            "content_type": content_type, "candidate_path": candidate_path,
+                            "body": body, "attempts": attempts_used,
+                        })
+                        if len(empty_png_run) == 2:
+                            first, second = empty_png_run
+                            empty_fingerprint = {
+                                "body_sha256": hashlib.sha256(b"").hexdigest(),
+                                "pixel_sha256": "", "ahash": -1, "width": 0,
+                                "height": 0, "ink_pixels": 0, "total_pixels": 0,
+                            }
+                            ew.writerow(evidence_row(
+                                doc_no, int(first["page"]),
+                                "exact_empty_png_probe_not_terminal", False,
+                                str(first["upstream"]), str(first["content_type"]),
+                                str(first["candidate_path"]), first["body"],
+                                attempts_exhausted=int(first["attempts"]),
+                            ))
+                            ew.writerow(evidence_row(
+                                doc_no, int(second["page"]), "exact_empty_repeat_end", True,
+                                str(second["upstream"]), str(second["content_type"]),
+                                str(second["candidate_path"]), second["body"],
+                                match=(int(first["page"]), empty_fingerprint,
+                                       "exact_empty_repeat_end"),
+                                attempts_exhausted=int(second["attempts"]),
+                            ))
+                            mw.writerow([
+                                doc_no, first["page"], "empty_png_probe",
+                                first["upstream"], "", 0, now_utc(),
+                            ])
+                            mw.writerow([
+                                doc_no, second["page"], "empty_png_end",
+                                second["upstream"], "", 0, now_utc(),
+                            ])
+                            empty_png_run.clear()
+                            doc_status = "done"
+                            break
+                    mf.flush()
+                    ff.flush()
+                    ef.flush()
+                    if page < args.max_pages:
+                        time.sleep(random.uniform(args.delay_min, args.delay_max))
+                    continue
+                if empty_png_run:
+                    flush_unconfirmed_empty_png()
                 if status == "ok" and body:
                     fingerprint = page_fingerprint_bytes(body)
                     if not is_substantive_page(fingerprint):
@@ -430,6 +534,8 @@ def main() -> int:
                 if page < args.max_pages:
                     time.sleep(random.uniform(args.delay_min, args.delay_max))
 
+            if empty_png_run:
+                flush_unconfirmed_empty_png()
             if pages_ok == 0 and doc_status == "done":
                 doc_status = "no_pages"
             if doc_status in {"max_pages_reached", "no_pages"}:
