@@ -193,6 +193,8 @@ jobs:
             out/pages_manifest.csv
             out/failed_pages.csv
             out/doc_status.csv
+            out/terminal_evidence.csv
+            out/terminal_candidates/
             out/pages_summary.json
           retention-days: 30
           if-no-files-found: warn

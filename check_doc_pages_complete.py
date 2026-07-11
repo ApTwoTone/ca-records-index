@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-"""Fail when a doc-page pull artifact has missing or capped pages."""
+"""Fail when a doc-page artifact lacks cryptographic terminal proof."""
+
 from __future__ import annotations
 
 import argparse
 import csv
 import json
-import sys
 from collections import Counter
 from pathlib import Path
 
+from doc_page_terminal_proof import validate_artifact_dir
 
-# A valid recorder document must have at least one fetched page. NETR sometimes
-# returns an upstream 500/end marker when a preview image fails to load, so
-# `no_pages` stays retryable instead of being counted complete.
+
 COMPLETE_DOC_STATUSES = {"done"}
 
 
-def count_csv_rows(path: Path) -> int:
+def read_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists():
-        return 0
-    with path.open(newline="", encoding="utf-8") as fh:
-        return sum(1 for _ in csv.DictReader(fh))
+        return []
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
 
 
 def main() -> int:
@@ -30,29 +29,34 @@ def main() -> int:
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
-    failed_pages = count_csv_rows(outdir / "failed_pages.csv")
-    status_rows = []
-    status_path = outdir / "doc_status.csv"
-    status_present = status_path.exists()
-    if status_path.exists():
-        with status_path.open(newline="", encoding="utf-8") as fh:
-            status_rows = list(csv.DictReader(fh))
+    failed_rows = read_csv(outdir / "failed_pages.csv")
+    status_rows = read_csv(outdir / "doc_status.csv")
     status_counts = Counter((row.get("status") or "").strip() for row in status_rows)
     incomplete_docs = [
         row for row in status_rows
         if (row.get("status") or "").strip() not in COMPLETE_DOC_STATUSES
     ]
-    has_status_proof = status_present and len(status_rows) > 0
-    ok = has_status_proof and failed_pages == 0 and not incomplete_docs
+    proof = validate_artifact_dir(outdir)
+    ok = (
+        bool(status_rows)
+        and not failed_rows
+        and not incomplete_docs
+        and proof["complete"] is True
+    )
     payload = {
         "ok": ok,
         "outdir": str(outdir),
-        "failed_pages": failed_pages,
-        "doc_status_present": status_present,
+        "failed_pages": len(failed_rows),
+        "doc_status_present": (outdir / "doc_status.csv").exists(),
         "doc_status_rows": len(status_rows),
         "doc_status_counts": dict(status_counts),
         "incomplete_docs": len(incomplete_docs),
         "sample_incomplete_docs": incomplete_docs[:20],
+        "manifest_rows": proof["manifest_rows"],
+        "terminal_evidence_rows": proof["terminal_evidence_rows"],
+        "terminal_proven_docs": len(proof["proven_docs"]),
+        "terminal_proof_errors": len(proof["errors"]),
+        "sample_terminal_proof_errors": proof["errors"][:20],
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
     if not ok and not args.allow_partial:
