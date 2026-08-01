@@ -1,0 +1,121 @@
+name: ain-doc-reverse-proof
+# Exact OCR candidate verification: search NETR by AIN and prove the expected
+# recorder document appears in the returned parcel chain. Research-only.
+on:
+  workflow_dispatch:
+    inputs:
+      candidates_b64: { required: true, type: string }
+      shards: { required: false, type: string, default: "20" }
+      attempts: { required: false, type: string, default: "4" }
+      delay_min: { required: false, type: string, default: "3.0" }
+      delay_max: { required: false, type: string, default: "4.0" }
+      max_pages: { required: false, type: string, default: "25" }
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      candidate_count: ${{ steps.plan.outputs.candidate_count }}
+    steps:
+      - id: plan
+        env:
+          CANDIDATES_B64: ${{ inputs.candidates_b64 }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import base64, gzip, hashlib, json, os, re
+          raw = gzip.decompress(base64.b64decode(os.environ["CANDIDATES_B64"])).decode()
+          rows, seen = [], set()
+          for line in raw.splitlines():
+              if not line.strip(): continue
+              row = json.loads(line)
+              ain = re.sub(r"\D", "", str(row.get("ain") or row.get("apn") or ""))
+              doc = re.sub(r"\D", "", str(row.get("doc_no") or ""))
+              if len(ain) != 10 or not doc: raise SystemExit("invalid exact candidate")
+              if (ain, doc) not in seen:
+                  seen.add((ain, doc)); rows.append({"ain": ain, "doc_no": doc})
+          if not rows or len(rows) > 400: raise SystemExit("candidate count must be 1..400")
+          n = min(max(1, int(os.environ["SHARDS"])), len(rows), 20)
+          per = -(-len(rows) // n)
+          matrix = []
+          for i in range(n):
+              part = rows[i*per:(i+1)*per]
+              if not part: continue
+              body = ("\n".join(json.dumps(x,sort_keys=True,separators=(",",":")) for x in part)+"\n").encode()
+              matrix.append({"i": i, "count": len(part),
+                             "payload_b64": base64.b64encode(gzip.compress(body)).decode(),
+                             "payload_sha256": hashlib.sha256(body).hexdigest()})
+          print("matrix=" + json.dumps({"include": matrix}, separators=(",",":")))
+          print("candidate_count=" + str(len(rows)))
+          PY
+
+  prove:
+    needs: plan
+    if: ${{ needs.plan.outputs.candidate_count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install curl_cffi
+        run: pip install --quiet curl_cffi
+      - name: write exact candidates and runner receipt
+        env:
+          PAYLOAD_B64: ${{ matrix.payload_b64 }}
+          PAYLOAD_SHA256: ${{ matrix.payload_sha256 }}
+          SHARD: ${{ matrix.i }}
+          CANDIDATE_COUNT: ${{ matrix.count }}
+        run: |
+          mkdir -p out
+          python3 - <<'PY'
+          import base64, datetime, gzip, hashlib, json, os, urllib.request
+          body = gzip.decompress(base64.b64decode(os.environ["PAYLOAD_B64"]))
+          if hashlib.sha256(body).hexdigest() != os.environ["PAYLOAD_SHA256"]:
+              raise SystemExit("candidate payload hash mismatch")
+          open("out/candidates.jsonl", "wb").write(body)
+          public_ip = None
+          try:
+              with urllib.request.urlopen("https://api.ipify.org?format=json", timeout=10) as r:
+                  public_ip = json.loads(r.read().decode())["ip"]
+          except Exception: pass
+          receipt = {
+              "schema_version": 1, "workflow": "ain-doc-reverse-proof",
+              "repository": os.environ.get("GITHUB_REPOSITORY"),
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "runner_name": os.environ.get("RUNNER_NAME"),
+              "runner_os": os.environ.get("RUNNER_OS"),
+              "runner_arch": os.environ.get("RUNNER_ARCH"),
+              "shard": int(os.environ["SHARD"]),
+              "candidate_count": int(os.environ["CANDIDATE_COUNT"]),
+              "candidate_payload_sha256": os.environ["PAYLOAD_SHA256"],
+              "public_egress_ip": public_ip,
+              "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "research_only": True, "callable_now": "NO", "contains_secrets": False,
+          }
+          open("out/runner_identity.json", "w").write(json.dumps(receipt,indent=2,sort_keys=True)+"\n")
+          PY
+      - name: prove AIN candidate shard
+        env:
+          NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
+        run: |
+          python3 verify_ain_doc_candidates.py out/candidates.jsonl out \
+            --attempts "${{ inputs.attempts }}" --delay-min "${{ inputs.delay_min }}" \
+            --delay-max "${{ inputs.delay_max }}" --max-pages "${{ inputs.max_pages }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ain-doc-reverse-proof-${{ github.run_id }}-${{ matrix.i }}
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
+
+# Artifacts are private research evidence; no outreach or callable state.
