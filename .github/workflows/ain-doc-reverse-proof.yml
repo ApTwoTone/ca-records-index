@@ -105,6 +105,8 @@ jobs:
               "research_only": True, "callable_now": "NO", "contains_secrets": False,
           }
           open("out/runner_identity.json", "w").write(json.dumps(receipt,indent=2,sort_keys=True)+"\n")
+          if not public_ip:
+              raise SystemExit("public egress IP receipt unavailable; fail closed")
           PY
       - name: prove AIN candidate shard
         env:
