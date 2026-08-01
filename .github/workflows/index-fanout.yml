@@ -53,7 +53,10 @@ jobs:
   harvest:
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # At NETR's safe ~18 requests/minute/IP, a 1,181-document shard needs
+    # roughly 66 minutes. Keep enough headroom for soft-wall retries while the
+    # completeness gate treats every throttle/error as unresolved, never absent.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -108,7 +111,7 @@ jobs:
               json.dump(receipt, fh, indent=2, sort_keys=True)
           PY
       - name: harvest shard ${{ matrix.i }}  (${{ matrix.start }}..${{ matrix.end }})
-        timeout-minutes: 24
+        timeout-minutes: 90
         env:
           DOCS_B64: ${{ matrix.docs_b64 }}
         run: |
