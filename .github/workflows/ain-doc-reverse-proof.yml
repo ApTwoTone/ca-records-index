@@ -41,10 +41,13 @@ jobs:
                   seen.add((ain, doc)); rows.append({"ain": ain, "doc_no": doc})
           if not rows or len(rows) > 400: raise SystemExit("candidate count must be 1..400")
           n = min(max(1, int(os.environ["SHARDS"])), len(rows), 20)
-          per = -(-len(rows) // n)
           matrix = []
           for i in range(n):
-              part = rows[i*per:(i+1)*per]
+              # Proportional boundaries guarantee exactly n non-empty shards
+              # whenever len(rows) >= n (ceil slicing can leave the last empty).
+              start = len(rows) * i // n
+              end = len(rows) * (i + 1) // n
+              part = rows[start:end]
               if not part: continue
               body = ("\n".join(json.dumps(x,sort_keys=True,separators=(",",":")) for x in part)+"\n").encode()
               matrix.append({"i": i, "count": len(part),
