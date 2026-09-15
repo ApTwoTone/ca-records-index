@@ -100,7 +100,7 @@ def search_page(session, ain: str, page: int, evidence_dir: Path, candidate_key:
     raw_path.write_bytes(body_bytes)
     receipt["evidence_file"] = raw_path.name
     if response.status_code != 200:
-        receipt.update(outcome="HTTP_ERROR", detail=f"http_{response.status_code}")
+        receipt.update(outcome="HTTP_ERROR", detail=f"http_{response.status_code}", retry_after=response.headers.get("Retry-After"))
         return receipt
     try:
         payload = json.loads(body)
@@ -110,7 +110,7 @@ def search_page(session, ain: str, page: int, evidence_dir: Path, candidate_key:
     count_html = payload[0] if isinstance(payload, list) and payload else ""
     results_html = payload[1] if isinstance(payload, list) and len(payload) > 1 else ""
     count_text = idx._clean(count_html)
-    if any(marker in count_text.lower() for marker in THROTTLE_MARKERS):
+    if any(marker in (count_text + " " + idx._clean(results_html)).lower() for marker in THROTTLE_MARKERS):
         receipt.update(outcome="THROTTLED", detail=count_text[:160])
         return receipt
     rows, skipped = parse_rows(results_html)
@@ -125,18 +125,32 @@ def search_page(session, ain: str, page: int, evidence_dir: Path, candidate_key:
     return receipt
 
 
+class PacedSession:
+    """One pacing clock shared by every candidate/page on this runner."""
+    def __init__(self, session, delay_min, delay_max):
+        self.session, self.delay_min, self.delay_max = session, delay_min, delay_max
+        self.last_finished = None
+    def post(self, *args, **kwargs):
+        if self.last_finished is not None:
+            time.sleep(max(0, random.uniform(self.delay_min, self.delay_max) - (time.monotonic() - self.last_finished)))
+        try:
+            return self.session.post(*args, **kwargs)
+        finally:
+            self.last_finished = time.monotonic()
+
+
 def prove_candidate(session, candidate: dict[str, str], evidence_dir: Path, attempts: int,
                     delay_min: float, delay_max: float, max_pages: int) -> dict:
     ain, expected = candidate["ain"], candidate["doc_no"]
     candidate_key = hashlib.sha256(f"{ain}|{expected}".encode()).hexdigest()[:20]
     request_receipts, chain_rows = [], []
     final_outcome, detail = "UNRESOLVED", "no valid response"
+    pagination_complete = False
     for attempt in range(1, attempts + 1):
+        expected_total = None
         page = 1
         chain_rows = []
         while page <= max_pages:
-            if request_receipts:
-                time.sleep(random.uniform(delay_min, delay_max))
             receipt = search_page(session, ain, page, evidence_dir, candidate_key, attempt)
             receipt.update(attempt=attempt, page=page)
             request_receipts.append(receipt)
@@ -144,21 +158,36 @@ def prove_candidate(session, candidate: dict[str, str], evidence_dir: Path, atte
                 final_outcome, detail = receipt["outcome"], receipt.get("detail")
                 break
             chain_rows.extend(receipt["rows"])
-            if any(row["doc_no"] == expected for row in chain_rows):
-                final_outcome, detail = "PROVEN", "expected doc_no appears in AIN result chain"
-                break
             total = receipt.get("total")
-            if total == 0:
+            ids = [row["doc_no"] for row in chain_rows]
+            if (receipt.get("parse_skipped") or any(not re.fullmatch(r"\d+", x) for x in ids)
+                    or len(set(ids)) != len(ids)):
+                final_outcome, detail = "PAGINATION_UNRESOLVED", "invalid, unparsed or repeated document rows"
+                break
+            if expected_total is None:
+                expected_total = total
+            elif total is not None and total != expected_total:
+                final_outcome, detail = "PAGINATION_UNRESOLVED", "provider count changed between pages"
+                break
+            if total == 0 and not chain_rows:
+                pagination_complete = True
                 final_outcome, detail = "NOT_FOUND", "valid response explicitly reported no documents for AIN"
                 break
-            if not receipt.get("capped") or (total is not None and len(chain_rows) >= total):
-                final_outcome = "EXPECTED_DOC_NOT_IN_CHAIN"
-                detail = "valid terminal chain did not contain expected doc_no"
+            if total is not None and len(chain_rows) == total:
+                pagination_complete = True
+                final_outcome = "PROVEN" if expected in ids else "EXPECTED_DOC_NOT_IN_CHAIN"
+                detail = "full counted chain contains expected doc_no" if expected in ids else "full counted chain excludes expected doc_no"
+                break
+            if (total is not None and len(chain_rows) > total) or not receipt["rows"]:
+                final_outcome, detail = "PAGINATION_UNRESOLVED", "rows do not cover provider count or terminal count unknown"
                 break
             page += 1
         else:
             final_outcome, detail = "PAGE_CAP_UNRESOLVED", f"reached max_pages={max_pages}"
         if final_outcome in {"PROVEN", "NOT_FOUND", "EXPECTED_DOC_NOT_IN_CHAIN"}:
+            break
+        if final_outcome == "THROTTLED" or receipt.get("detail") == "http_429" or receipt.get("retry_after"):
+            # Stop this runner's candidate queue; never move the query to another IP.
             break
         if attempt < attempts:
             time.sleep(min(20.0, 3.0 * attempt) + random.uniform(0.5, 1.5))
@@ -167,6 +196,7 @@ def prove_candidate(session, candidate: dict[str, str], evidence_dir: Path, atte
         "schema_version": 1, "candidate_key": candidate_key, "ain": ain,
         "expected_doc_no": expected, "outcome": final_outcome, "detail": detail,
         "proved": final_outcome == "PROVEN", "matched_row": matched,
+        "target_found": matched is not None, "pagination_complete": pagination_complete,
         "chain_doc_nos": [row["doc_no"] for row in chain_rows],
         "request_receipts": request_receipts, "finished_at": now(),
         "research_only": True, "callable_now": "NO",
@@ -189,10 +219,18 @@ def main() -> int:
         raise SystemExit("candidate list is empty")
     out = Path(args.out_dir); evidence = out / "evidence"
     evidence.mkdir(parents=True, exist_ok=True)
-    session = idx._session()
-    results = [prove_candidate(session, row, evidence, args.attempts,
-                               args.delay_min, args.delay_max, args.max_pages)
-               for row in candidates]
+    session = PacedSession(idx._session(), args.delay_min, args.delay_max)
+    results = []
+    stopped = False
+    for row in candidates:
+        if stopped:
+            result = dict(ain=row["ain"], expected_doc_no=row["doc_no"], candidate_key=hashlib.sha256((row["ain"] + "|" + row["doc_no"]).encode()).hexdigest()[:20], outcome="RUNNER_STOPPED_THROTTLE", proved=False,
+                          pagination_complete=False, target_found=False, request_receipts=[], chain_doc_nos=[], matched_row=None,
+                          detail="earlier provider throttle stopped this runner", research_only=True, callable_now="NO")
+        else:
+            result = prove_candidate(session, row, evidence, args.attempts, args.delay_min, args.delay_max, args.max_pages)
+            stopped = result["outcome"] == "THROTTLED" or any(r.get("detail") == "http_429" or r.get("retry_after") for r in result["request_receipts"])
+        results.append(result)
     with (out / "ain_doc_reverse_proof.jsonl").open("w", encoding="utf-8") as fh:
         for row in results:
             fh.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
