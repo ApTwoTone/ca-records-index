@@ -175,6 +175,11 @@ jobs:
         timeout-minutes: 28
         env:
           NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
+          # Second Worker (its own Cloudflare account). Shards alternate which
+          # one they start on, and the two repos start opposite each other.
+          NETR_PROXY_KEY_2: ${{ secrets.NETR_PROXY_KEY_2 }}
+          NETR_WORKER_START: ${{ matrix.i }}
+          NETR_WORKER_FLIP: ${{ github.repository_owner == 'zoarbathrooms-rgb' && '1' || '0' }}
         run: |
           test -n "$NETR_PROXY_KEY"
           mkdir -p out

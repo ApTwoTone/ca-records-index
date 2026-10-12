@@ -78,6 +78,184 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(opened.call_count, 8)
 
 
+class SecondWorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(pull_docs.WORKERS.clear)
+
+    def test_spent_daily_allowance_switches_to_the_other_worker_for_good(self):
+        page = png_bytes(Image.effect_noise((256, 256), 64))
+        self.assertGreater(len(page), 5000)
+        seen = []
+
+        class PageResponse:
+            status = 200
+            headers = {"Content-Type": "image/png"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                return page
+
+        def urlopen(request, **_kwargs):
+            seen.append((request.full_url, request.get_header("X-auth")))
+            if request.full_url.startswith(pull_docs.WORKER + "/"):
+                raise pull_docs.urllib.error.HTTPError(
+                    request.full_url, 429, "Too Many Requests", {},
+                    io.BytesIO(b"error code: 1027"),
+                )
+            return PageResponse()
+
+        pull_docs.WORKERS[:] = [(pull_docs.WORKER, "first"), (pull_docs.WORKER_2, "second")]
+        with mock.patch.object(pull_docs.urllib.request, "urlopen", side_effect=urlopen), \
+                mock.patch.object(pull_docs.time, "sleep"):
+            first = pull_docs.fetch_page("unused", "20260000000", 1, 8)
+            second = pull_docs.fetch_page("unused", "20260000000", 2, 8)
+        self.assertEqual((first[0], second[0]), ("ok", "ok"))
+        self.assertEqual(seen, [
+            (pull_docs.WORKER + "/thumb/20260000000/1", "first"),
+            (pull_docs.WORKER_2 + "/thumb/20260000000/1", "second"),
+            (pull_docs.WORKER_2 + "/thumb/20260000000/2", "second"),
+        ])
+        self.assertEqual(pull_docs.worker_label(), "netr-thumb.zoarbathrooms-cd2.workers.dev")
+
+    def test_last_worker_is_kept_when_its_allowance_is_spent_too(self):
+        def urlopen(request, **_kwargs):
+            raise pull_docs.urllib.error.HTTPError(
+                request.full_url, 429, "Too Many Requests", {},
+                io.BytesIO(b"error code: 1027"),
+            )
+
+        pull_docs.WORKERS[:] = [(pull_docs.WORKER, "first"), (pull_docs.WORKER_2, "second")]
+        with mock.patch.object(pull_docs.urllib.request, "urlopen", side_effect=urlopen), \
+                mock.patch.object(pull_docs.time, "sleep"):
+            result = pull_docs.fetch_page("unused", "20260000000", 1, 8)
+        self.assertEqual(result[0], "retry_out")
+        self.assertEqual(pull_docs.WORKERS, [(pull_docs.WORKER_2, "second")])
+
+    def test_a_worker_that_only_answers_429_hands_the_page_to_the_other(self):
+        page = png_bytes(Image.effect_noise((256, 256), 64))
+        calls = []
+
+        class PageResponse:
+            status = 200
+            headers = {"Content-Type": "image/png"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                return page
+
+        def urlopen(request, **_kwargs):
+            calls.append(request.full_url)
+            if request.full_url.startswith(pull_docs.WORKER + "/"):
+                raise pull_docs.urllib.error.HTTPError(
+                    request.full_url, 429, "Too Many Requests", {}, io.BytesIO(b"slow down"))
+            return PageResponse()
+
+        pull_docs.WORKERS[:] = [(pull_docs.WORKER, "first"), (pull_docs.WORKER_2, "second")]
+        with mock.patch.object(pull_docs.urllib.request, "urlopen", side_effect=urlopen), \
+                mock.patch.object(pull_docs.time, "sleep"):
+            result = pull_docs.fetch_page("unused", "20260000000", 1, 8)
+        self.assertEqual((result[0], result[4]), ("ok", 1))
+        self.assertEqual(len(calls), 9)          # 8 on the first Worker, 1 on the second
+        self.assertEqual(pull_docs.WORKERS, [(pull_docs.WORKER_2, "second")])
+
+    def test_a_worker_with_a_wrong_key_hands_the_page_to_the_other(self):
+        def urlopen(request, **_kwargs):
+            raise pull_docs.urllib.error.HTTPError(
+                request.full_url, 403, "Forbidden", {}, io.BytesIO(b"forbidden"))
+
+        pull_docs.WORKERS[:] = [(pull_docs.WORKER, "first"), (pull_docs.WORKER_2, "second")]
+        with mock.patch.object(pull_docs.urllib.request, "urlopen", side_effect=urlopen) as opened, \
+                mock.patch.object(pull_docs.time, "sleep"):
+            result = pull_docs.fetch_page("unused", "20260000000", 1, 8)
+        self.assertEqual(result[0], "retry_out")
+        self.assertEqual(opened.call_count, 16)
+        self.assertEqual(pull_docs.WORKERS, [(pull_docs.WORKER_2, "second")])
+
+    def test_a_500_from_a_spent_worker_is_not_the_end_of_the_document(self):
+        def urlopen(request, **_kwargs):
+            raise pull_docs.urllib.error.HTTPError(
+                request.full_url, 500, "x", {}, io.BytesIO(b"<html>Error 1027</html>"))
+
+        pull_docs.WORKERS[:] = [(pull_docs.WORKER, "first"), (pull_docs.WORKER_2, "second")]
+        with mock.patch.object(pull_docs.urllib.request, "urlopen", side_effect=urlopen), \
+                mock.patch.object(pull_docs.time, "sleep"):
+            both = pull_docs.fetch_page("unused", "20260000000", 1, 8)
+            pull_docs.WORKERS.clear()            # a run with only the first key
+            only = pull_docs.fetch_page("key", "20260000000", 1, 8)
+        self.assertEqual((both[0], only[0]), ("retry_out", "retry_out"))
+
+    def test_a_recorder_answer_that_only_contains_the_digits_is_still_the_end(self):
+        def urlopen(request, **_kwargs):
+            raise pull_docs.urllib.error.HTTPError(
+                request.full_url, 500, "x", {},
+                io.BytesIO(b"Internal Server Error: no page for 20261027000"))
+
+        workers = [(pull_docs.WORKER, "first"), (pull_docs.WORKER_2, "second")]
+        pull_docs.WORKERS[:] = workers
+        with mock.patch.object(pull_docs.urllib.request, "urlopen", side_effect=urlopen), \
+                mock.patch.object(pull_docs.time, "sleep"):
+            result = pull_docs.fetch_page("unused", "20261027000", 4, 8)
+        self.assertEqual((result[0], result[2], result[4]), ("end", "500", 1))
+        self.assertEqual(pull_docs.WORKERS, workers)
+        for body in (b"error code: 1027", b"<title>Error 1027</title>",
+                     b'<span class="cf-error-type">Error</span> <span class="cf-error-code">1027</span>'):
+            self.assertIsNotNone(pull_docs.CLOUDFLARE_DAY_SPENT.search(body), body)
+
+    def test_workers_need_a_key_and_rotate_by_shard_and_repo(self):
+        first, second = (pull_docs.WORKER, "k1"), (pull_docs.WORKER_2, "k2")
+        cases = [
+            ({}, [first]),
+            ({"NETR_WORKER_START": "1", "NETR_WORKER_FLIP": "1"}, [first]),
+            ({"NETR_PROXY_KEY_2": "k2"}, [first, second]),
+            ({"NETR_PROXY_KEY_2": "k2", "NETR_WORKER_START": "1"}, [second, first]),
+            ({"NETR_PROXY_KEY_2": "k2", "NETR_WORKER_FLIP": "1"}, [second, first]),
+            ({"NETR_PROXY_KEY_2": "k2", "NETR_WORKER_START": "3", "NETR_WORKER_FLIP": "1"},
+             [first, second]),
+        ]
+        for env, expected in cases:
+            with mock.patch.dict(pull_docs.os.environ, env, clear=True):
+                self.assertEqual(pull_docs.read_workers("k1"), expected, env)
+
+    def test_manifest_rows_name_the_worker_in_use(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doclist = root / "docs.txt"
+            doclist.write_text("20260000009\n", encoding="utf-8")
+            out = root / "out"
+            body = png_bytes(Image.effect_noise((256, 256), 64))
+            responses = iter([
+                ("ok", body, "200", "image/png", 1),
+                ("end", b"ended", "500", "text/plain", 1),
+            ])
+            argv = [
+                "pull_docs.py", str(doclist), str(out), "--max-pages", "8",
+                "--delay-min", "0", "--delay-max", "0",
+            ]
+            env = {"NETR_PROXY_KEY_2": "k2", "NETR_WORKER_START": "1"}
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.dict(pull_docs.os.environ, env, clear=True), \
+                    mock.patch.object(pull_docs, "read_key", return_value="test"), \
+                    mock.patch.object(pull_docs, "fetch_page", side_effect=lambda *_: next(responses)):
+                self.assertEqual(pull_docs.main(), 0)
+            with (out / "pages_manifest.csv").open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([row["status"] for row in rows], ["ok", "end"])
+            self.assertEqual(
+                {row["worker"] for row in rows}, {"netr-thumb.zoarbathrooms-cd2.workers.dev"})
+
+
 class CompletionProofTests(unittest.TestCase):
     def write_csv(self, path: Path, fields: list[str], rows: list[dict[str, object]]) -> None:
         with path.open("w", newline="", encoding="utf-8") as handle:

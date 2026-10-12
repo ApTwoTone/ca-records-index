@@ -22,6 +22,7 @@ import io
 import json
 import os
 import random
+import re
 import ssl
 import time
 import urllib.error
@@ -32,6 +33,14 @@ from PIL import Image
 
 
 WORKER = "https://netr-thumb.kaiescobar09.workers.dev"
+WORKER_2 = "https://netr-thumb.zoarbathrooms-cd2.workers.dev"
+# (address, key) in the order to use them. Each Worker is its own Cloudflare
+# account with its own 100,000 requests a day; fetch_page drops the first one
+# when Cloudflare says that account's day is spent.
+WORKERS: list[tuple[str, str]] = []
+# Cloudflare's own error 1027 ("error code: 1027", or its HTML error page), not
+# a recorder answer that merely contains those digits, e.g. a document number.
+CLOUDFLARE_DAY_SPENT = re.compile(rb"(?i)error[^0-9]{0,80}1027(?![0-9])")
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 CTX = ssl.create_default_context()
 
@@ -53,6 +62,34 @@ def read_key() -> str:
     if key_path.exists():
         return key_path.read_text(encoding="utf-8").strip()
     raise SystemExit("missing NETR_PROXY_KEY or /tmp/netr_proxy_key")
+
+
+def read_workers(first_key: str) -> list[tuple[str, str]]:
+    """Every Worker that has a key, rotated so shards and repos start on
+    different accounts and a normal day is split across both."""
+    workers = [(WORKER, first_key)]
+    second_key = os.environ.get("NETR_PROXY_KEY_2", "").strip()
+    if second_key:
+        workers.append((WORKER_2, second_key))
+    start = sum(
+        int(os.environ.get(name, "").strip() or 0)
+        for name in ("NETR_WORKER_START", "NETR_WORKER_FLIP")
+    ) % len(workers)
+    return workers[start:] + workers[:start]
+
+
+def worker_label() -> str:
+    return (WORKERS[0][0] if WORKERS else WORKER).split("//", 1)[1]
+
+
+class WorkerStamped:
+    """pages_manifest.csv writer that ends each row with the Worker in use."""
+
+    def __init__(self, writer):
+        self.writer = writer
+
+    def writerow(self, row) -> None:
+        self.writer.writerow([*row, worker_label()])
 
 
 def is_valid_png(path: Path) -> bool:
@@ -146,11 +183,14 @@ def is_substantive_page(fingerprint: dict[str, int | str]) -> bool:
 def fetch_page(
     key: str, doc_no: str, page: int, attempts: int
 ) -> tuple[str, bytes | None, str, str, int]:
-    url = f"{WORKER}/thumb/{doc_no}/{page}"
     empty_png = None
-    for attempt in range(1, attempts + 1):
+    attempt = 0
+    while attempt < attempts:
+        attempt += 1
+        worker, worker_key = WORKERS[0] if WORKERS else (WORKER, key)
+        url = f"{worker}/thumb/{doc_no}/{page}"
         try:
-            req = urllib.request.Request(url, headers={"X-Auth": key, "User-Agent": UA})
+            req = urllib.request.Request(url, headers={"X-Auth": worker_key, "User-Agent": UA})
             with urllib.request.urlopen(req, timeout=45, context=CTX) as resp:
                 upstream = resp.headers.get("X-Upstream-Status", str(resp.status))
                 content_type = resp.headers.get("Content-Type", "")
@@ -179,6 +219,22 @@ def fetch_page(
                 body = exc.read()
             except Exception:
                 body = b""
+            day_spent = CLOUDFLARE_DAY_SPENT.search(body) is not None
+            if len(WORKERS) > 1 and (
+                day_spent or (exc.code in {403, 429} and attempt == attempts)
+            ):
+                # Cloudflare error 1027: this account's daily requests are
+                # spent. A Worker that refused every attempt (429, or 403 for
+                # a wrong key) is treated the same. Use the next Worker from
+                # here on, with this page's attempts afresh.
+                WORKERS.pop(0)
+                attempt = 0
+                continue
+            if day_spent:
+                # No other Worker to move to. Checked before the 500 rule so
+                # Cloudflare's error can never be read as the end of a document.
+                time.sleep(min(12.0, 1.5 * attempt) + random.uniform(0, 1.5))
+                continue
             if exc.code == 500:
                 return "end", body, str(exc.code), content_type, attempt
             if exc.code in {403, 429, 502, 503, 504}:
@@ -285,6 +341,7 @@ def main() -> int:
     args = parser.parse_args()
 
     key = read_key()
+    WORKERS[:] = read_workers(key)
     doclist = Path(args.doclist)
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -311,7 +368,11 @@ def main() -> int:
         sw = csv.writer(sf)
         ew = csv.DictWriter(ef, fieldnames=EVIDENCE_FIELDS)
         if not manifest_exists:
-            mw.writerow(["doc_no", "page", "status", "upstream_status", "path", "bytes", "fetched_at_utc"])
+            mw.writerow([
+                "doc_no", "page", "status", "upstream_status", "path", "bytes",
+                "fetched_at_utc", "worker",
+            ])
+        mw = WorkerStamped(mw)
         if not failed_exists:
             fw.writerow(["doc_no", "page", "status", "upstream_status", "attempted_at_utc"])
         if not status_exists:
