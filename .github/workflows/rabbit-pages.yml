@@ -1,7 +1,5 @@
 name: rabbit-pages
-# Rabbit's NETR page pull (rabbit_pages.py): each page asked once through the Worker, a document stops at its first
-# blank or end page, a shard stops at its first refusal. Dispatched on demand by the Spark (netr_read.runners); no
-# schedule.
+# Dispatched by python3 -m netr_read.runners pages; the stop rules are in rabbit_pages.py.
 on:
   workflow_dispatch:
     inputs:
