@@ -1,0 +1,56 @@
+name: rabbit-pages
+# Rabbit's NETR page pull (rabbit_pages.py): each page asked once through the Worker, a document stops at its first
+# blank or end page, a shard stops at its first refusal. Dispatched on demand by the Spark (netr_read.runners); no
+# schedule.
+on:
+  workflow_dispatch:
+    inputs:
+      doc_nos: { required: true, type: string }
+      shards: { required: false, type: string, default: "10" }
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        env:
+          DOC_NOS: ${{ inputs.doc_nos }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          docs = list(dict.fromkeys(os.environ["DOC_NOS"].replace(",", " ").split()))
+          n = max(1, min(int(os.environ["SHARDS"]), len(docs)))
+          print("matrix=" + json.dumps({"include": [{"i": i, "docs": " ".join(docs[i::n])} for i in range(n)]}))
+          PY
+
+  pull:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: pull pages for shard ${{ matrix.i }}
+        env:
+          NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
+          DOCS: ${{ matrix.docs }}
+        run: |
+          test -n "$NETR_PROXY_KEY"
+          echo "$DOCS" > doclist.txt
+          python3 rabbit_pages.py doclist.txt out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rabbit-pages-${{ matrix.i }}
+          path: out/
+          retention-days: 3
