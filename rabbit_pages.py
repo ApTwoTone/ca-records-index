@@ -2,23 +2,41 @@
 """rabbit_pages.py DOCLIST OUTDIR: Rabbit's NETR page puller (Kai 2026-10-16; Nora's ANALYSIS.md §4 and §8).
 
 Each page is asked once, through the NETR Worker, 5-7 s apart. A document stops at its first page that isn't a page:
-NETR's end answer (Worker upstream 500) or a repeat of an earlier page ends it; a 0-byte PNG is NETR's "no scan yet"
-and ends it as blank. Nothing that answered is asked again. A 403, a 429 or any other answer stops the whole shard,
-and every document after it is not asked. OUTDIR gets <doc>_<page>.png and status.csv: doc_no, state, pages, requests.
+past the last page NETR serves the last page again (its PNG's Thumb::URI names the TIFF page it came from, ".tif[k]",
+and k stops following the page asked), and an end answer (Worker upstream 500) or a byte repeat ends it too; a 0-byte
+PNG is NETR's "no scan yet" and ends it as blank. Nothing that answered is asked again. A 403, a 429 or any other
+answer stops the whole shard, and every document after it is not asked. OUTDIR gets <doc>_<page>.png and status.csv: doc_no, state, pages, requests.
 """
 import csv
 import hashlib
 import os
 import random
+import re
+import struct
 import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 from pathlib import Path
 
 WORKER = "https://netr-thumb.kaiescobar09.workers.dev"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 MAX_PAGES, MIN_PNG = 9, 5000
+
+
+def served(png: bytes) -> int | None:
+    """The TIFF page index NETR rendered this PNG from (Thumb::URI ".../<doc>.tif[k]"), or None if it doesn't say."""
+    at = 8
+    while at + 8 <= len(png):
+        size, kind = struct.unpack(">I4s", png[at:at + 8])
+        data = png[at + 8:at + 8 + size]
+        if kind in (b"tEXt", b"zTXt") and data.startswith(b"Thumb::URI\0"):
+            text = data[11:] if kind == b"tEXt" else zlib.decompress(data[12:])
+            m = re.search(rb"\.tif\[(\d+)\]$", text)
+            return int(m[1]) if m else None
+        at += 12 + size
+    return None
 
 
 def ask(key: str, doc: str, page: int) -> tuple[str, bytes]:
@@ -59,7 +77,7 @@ def main() -> int:
                 answer, body = ask(key, doc, page)
                 asked += 1
                 sha = hashlib.sha256(body).hexdigest()
-                if answer == "page" and sha not in seen:
+                if answer == "page" and sha not in seen and served(body) in (page - 1, None):
                     seen.add(sha)
                     (out / f"{doc}_{page}.png").write_bytes(body)
                     continue
