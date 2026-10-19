@@ -3,7 +3,8 @@
 
 GET /losangeles once for its "Database current to" date, then POST /lasearch once per number, no retry
 (la_county_index.fetch with RETRIES 0). A wall or an answer that is neither a row nor "no documents" stops the look
-there. Prints JSON: banner, status, wall, docs (doc_no, ok, county_type, record_date, reason), requests.
+there: a network error is "error" (the Spark counts it as a failed look), any other answer is "wall" (the Spark
+stops). Prints JSON: banner, status, wall, error, docs (doc_no, ok, county_type, record_date, reason), requests.
 """
 import json
 import re
@@ -16,12 +17,12 @@ WALLS = ("too many searches", "please wait a moment", "unusual activity", "unusu
 
 
 def look(docs: list[str]) -> dict:
-    out = {"banner": None, "status": None, "wall": None, "docs": [], "requests": 1}
+    out = {"banner": None, "status": None, "wall": None, "error": None, "docs": [], "requests": 1}
     session = idx.creq.Session(impersonate=idx.IMPERSONATE)
     try:
         page = session.get(idx.FORM_URL, timeout=idx.TIMEOUT)
     except Exception as e:
-        out["wall"] = f"/losangeles: {type(e).__name__}"
+        out["error"] = f"/losangeles: {type(e).__name__}"
         return out
     out["status"], text = page.status_code, page.text
     if m := re.search(r"Database current to\s*<strong>\s*(\d{4}-\d{2}-\d{2})\s*</strong>", text, re.I):
@@ -35,7 +36,7 @@ def look(docs: list[str]) -> dict:
         out["requests"] += 1
         out["docs"].append({k: got[k] for k in ("doc_no", "ok", "county_type", "record_date", "reason")})
         if not got["ok"] and got["reason"] != "not_found":
-            out["wall"] = f"{doc}: {got['reason']}"
+            out["error" if got["reason"].startswith("request_error") else "wall"] = f"{doc}: {got['reason']}"
             break
     return out
 
