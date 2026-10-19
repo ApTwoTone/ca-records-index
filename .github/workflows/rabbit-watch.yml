@@ -1,0 +1,30 @@
+name: rabbit-watch
+# Dispatched by python3 -m netr_read.watch: one look at NETR's LA date and the next numbers (rabbit_watch.py).
+on:
+  workflow_dispatch:
+    inputs:
+      doc_nos: { required: true, type: string }
+
+permissions:
+  contents: read
+
+jobs:
+  look:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install --quiet curl_cffi
+      - name: look at NETR LA
+        env:
+          DOCS: ${{ inputs.doc_nos }}
+        run: |
+          mkdir -p out
+          python3 rabbit_watch.py $DOCS > out/probe.json
+          cat out/probe.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rabbit-watch
+          path: out/
+          retention-days: 3
