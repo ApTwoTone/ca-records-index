@@ -91,7 +91,8 @@ def main() -> int:
                     (out / f"{doc}_{page}.png").write_bytes(body)
                     continue
                 if answer not in ("page", "end", "blank"):
-                    (out / f"{doc}_{page}.body").write_bytes(f"Content-Type: {kind}\n\n".encode() + body[:HEAD_BYTES])
+                    head = body.replace(key.encode(), b"[key]")[:HEAD_BYTES]
+                    (out / f"{doc}_{page}.body").write_bytes(f"Content-Type: {kind}\n\n".encode() + head)
                 if answer in ("page", "end"):
                     state = "done" if page > 1 else "no_pages"
                 elif answer == "blank":
