@@ -7,8 +7,9 @@ and k stops following the page asked), and an end answer (Worker upstream 500) o
 PNG is NETR's "no scan yet" and ends it as blank. A 200 with no page image that names no wall is that document's own
 state (no_image_200), until more than NO_IMAGE_TRIP in one shard. Nothing that answered is asked again. A 403, a 429,
 a 200 naming a Cloudflare challenge, a denial or a rate limit, or any other answer stops the whole shard, and every
-document after it is not asked. OUTDIR gets <doc>_<page>.png or .jpg, status.csv (doc_no, state, pages, requests) and, for
-each answer that was not a page, <doc>_<page>.body: its Content-Type and first HEAD_BYTES bytes.
+document after it is not asked. A page is known by its bytes: PNG, JPEG, WebP, GIF, TIFF or PDF. OUTDIR gets
+<doc>_<page>.<its extension>, status.csv (doc_no, state, pages, requests) and, for each answer that was not a page,
+<doc>_<page>.body: its Content-Type and first HEAD_BYTES bytes.
 """
 import csv
 import hashlib
@@ -25,11 +26,28 @@ from pathlib import Path
 
 WORKER = "https://netr-thumb.kaiescobar09.workers.dev"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-MAX_PAGES, MIN_PNG = 9, 5000
+# A PNG page under MIN_PNG is a cut-off head; other formats are smaller (a white JPEG page is about 1.9 KB), and a JPEG
+# must also end with its end marker, since a progressive JPEG's head alone still opens as a blurry page.
+MAX_PAGES, MIN_PNG, MIN_OTHER = 9, 5000, 1000
 NO_IMAGE_TRIP, HEAD_BYTES = 3, 2048
 JPEG = b"\xff\xd8\xff"   # NETR serves grey JPEG pages since 2026-10-21, PNG before
+MAGIC = {b"\x89PNG": "png", JPEG: "jpg", b"GIF8": "gif", b"II*\0": "tif", b"MM\0*": "tif", b"%PDF-": "pdf"}
+EXTENSIONS = ("png", "jpg", "webp", "gif", "tif", "pdf")
 WALL = re.compile(rb"cloudflare|cf[-_]ray|cf_chl|challenge|captcha|just a moment|attention required|access denied"
                   rb"|forbidden|blocked|unauthori[sz]ed|rate[ -_]?limit|too many", re.I)
+
+
+def extension(body: bytes) -> str | None:
+    """The page file extension its first bytes name, or None if it is not a page image."""
+    if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return "webp"
+    return next((ext for magic, ext in MAGIC.items() if body.startswith(magic)), None)
+
+
+def whole(body: bytes) -> bool:
+    ext = extension(body)
+    return bool(ext) and len(body) >= (MIN_PNG if ext == "png" else MIN_OTHER) and (
+        ext != "jpg" or body.endswith(b"\xff\xd9"))
 
 
 def served(png: bytes) -> int | None:
@@ -59,11 +77,11 @@ def ask(key: str, doc: str, page: int) -> tuple[str, bytes, str]:
             return "error_500", body, kind
     except OSError as e:
         return f"error_{type(e).__name__}", b"", ""
-    if body.startswith((b"\x89PNG", JPEG)) and len(body) >= MIN_PNG:
+    if whole(body):
         return "page", body, kind
     if upstream == "500":
         return "end", body, kind
-    if upstream == "200" and kind.split(";")[0].strip().lower() == "image/png" and not body:
+    if upstream == "200" and kind.split(";")[0].strip().lower().startswith("image/") and not body:
         return "blank", body, kind
     if upstream == "200" and not WALL.search(body):
         return "no_image_200", body, kind
@@ -91,7 +109,7 @@ def main() -> int:
                 sha = hashlib.sha256(body).hexdigest()
                 if answer == "page" and sha not in seen and served(body) in (page - 1, None):
                     seen.add(sha)
-                    (out / f"{doc}_{page}.{'jpg' if body[:2] == JPEG[:2] else 'png'}").write_bytes(body)
+                    (out / f"{doc}_{page}.{extension(body)}").write_bytes(body)
                     continue
                 if answer not in ("page", "end", "blank"):
                     head = body.replace(key.encode(), b"[key]")[:HEAD_BYTES]
