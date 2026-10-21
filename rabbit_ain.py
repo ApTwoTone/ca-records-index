@@ -16,7 +16,8 @@ clock for the whole process, 2.9-3.5 s between any two POSTs. Each POST is sent 
   not_asked: why    the shard stopped earlier (first 403/429, or MAX_WALLED walled pairs); nothing was sent
 OUTDIR gets status.csv (ain, doc_no, state, pages, requests) and companions.csv: every row the walk read whose doc#
 is within +/-5 of the pair's (LA's AIN index never lists an AOD; Rabbit proves it by a same-day companion recording
-that shares a person). Names leave only as salted hashes (token_hashes, salt NAME_SALT); with no salt, no tokens.
+that shares a person). Names leave only as salted hashes, one group per party (token_groups, joined " | ", salt
+NAME_SALT); with no salt, no tokens.
 No bodies, no clear names (public repo).
 """
 import csv
@@ -39,16 +40,22 @@ HEADERS = {"Referer": idx.FORM_URL, "Origin": idx.BASE, "X-Requested-With": "XML
 NEAR = 5
 STOP = {"TRUST", "TRUSTEE", "TRUSTEES", "TR", "LLC", "INC", "CORP", "CORPORATION", "COMPANY", "CO", "BANK", "NA",
         "THE", "OF", "AND", "ESTATE", "DECEASED", "DEC", "LIVING", "REVOCABLE", "FAMILY", "JR", "SR", "II", "III",
-        "AKA", "FKA", "ET", "AL"}
+        "AKA", "FKA", "ET", "AL", "DE", "LA", "DEL", "LOS", "LAS", "DA", "DOS", "VAN", "VON", "DER", "Y", "SUCCESSOR",
+        "SURVIVING", "SPOUSE", "DATED"}
 
 
 def token_hashes(names: list[str]) -> list[str]:
     """Sorted unique salted hashes of the name tokens; [] without NAME_SALT, so a clear name never leaves."""
-    salt = os.environ.get("NAME_SALT", "")
+    salt = os.environ.get("NAME_SALT", "").strip()
     if not salt:
         return []
     tokens = {t for n in names for t in re.findall(r"[A-Z]{2,}", n.upper())} - STOP
     return sorted({hashlib.sha256((salt + ":" + t).encode()).hexdigest()[:16] for t in tokens})
+
+
+def token_groups(names: list[str]) -> list[list[str]]:
+    """One token_hashes group per party name, in order; empty and repeated groups dropped."""
+    return [list(g) for g in dict.fromkeys(tuple(token_hashes([n])) for n in names) if g]
 
 
 def ask(session, ain: str, page: int) -> tuple[str, int | None, list[tuple]]:
@@ -141,7 +148,7 @@ def main() -> int:
             elif state == "walled" and (walled := walled + 1) >= MAX_WALLED:
                 stopped = f"{walled} pairs walled, the last {ain}:{doc}"
             w.writerow([ain, doc, state, pages, asked])
-            c.writerows([ain, doc, comp, date, ctype, " ".join(token_hashes(names))]
+            c.writerows([ain, doc, comp, date, ctype, " | ".join(" ".join(g) for g in token_groups(names))]
                         for comp, date, ctype, names in near.values())
             fh.flush()
             ch.flush()

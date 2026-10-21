@@ -104,19 +104,29 @@ class ShardTests(unittest.TestCase):
 
     def companion_page(self):
         plus2, minus7 = str(int(DOC) + 2), str(int(DOC) - 7)
-        names = {plus2: ("JOHN Q SMITH", "SMITH FAMILY TRUST<br>JOHN Q SMITH"), minus7: ("JOHN Q SMITH", "X")}
+        names = {plus2: ("JOHN Q SMITH", "SMITH FAMILY TRUST<br>MARIA DE LA CRUZ"), minus7: ("JOHN Q SMITH", "X")}
         return page(3, [minus7, plus2, DOC], names), plus2
 
     def test_neighbours_within_5_are_reported_with_salted_name_hashes(self):
         answer, plus2 = self.companion_page()
         self.assertEqual(self.run_shard([f"{AIN}:{DOC}"], [answer], salt="test-salt")[0], ["proven"])
         rows = list(csv.DictReader(self.companions.splitlines()))
-        with mock.patch.dict("os.environ", {"NAME_SALT": "test-salt"}):
-            want = rabbit_ain.token_hashes(["JOHN Q SMITH", "SMITH FAMILY TRUST"])
-        self.assertEqual(len(want), 2)  # JOHN, SMITH; Q, FAMILY, TRUST dropped
+        with mock.patch.dict("os.environ", {"NAME_SALT": " test-salt\n"}):
+            john = rabbit_ain.token_hashes(["JOHN Q SMITH"])
+            trust, cruz = rabbit_ain.token_hashes(["SMITH FAMILY TRUST"]), rabbit_ain.token_hashes(["CRUZ MARIA"])
+            self.assertEqual(rabbit_ain.token_groups(["DE LA CRUZ"]), [rabbit_ain.token_hashes(["CRUZ"])])
+        self.assertEqual((len(john), len(trust), len(cruz)), (2, 1, 2))  # Q, FAMILY, TRUST, DE, LA dropped
         self.assertEqual(rows, [{"ain": AIN, "doc_no": DOC, "companion": plus2, "record_date": "2024-09-20",
-                                 "county_type": "DEED", "tokens": " ".join(want)}])
+                                 "county_type": "DEED", "tokens": " | ".join(map(" ".join, [john, trust, cruz]))}])
         self.assertNotIn("SMITH", self.companions.upper())
+        self.assertNotIn("CRUZ", self.companions.upper())
+
+    def test_one_group_per_party(self):
+        with mock.patch.dict("os.environ", {"NAME_SALT": "s"}):
+            groups = rabbit_ain.token_groups(["JOHN Q SMITH", "SMITH FAMILY TRUST", "JOHN SMITH", "THE TRUST"])
+            self.assertEqual(groups, [rabbit_ain.token_hashes(["JOHN SMITH"]), rabbit_ain.token_hashes(["SMITH"])])
+        with mock.patch.dict("os.environ", {"NAME_SALT": "  "}):
+            self.assertEqual(rabbit_ain.token_groups(["JOHN SMITH"]), [])
 
     def test_no_salt_writes_no_tokens(self):
         answer, plus2 = self.companion_page()
