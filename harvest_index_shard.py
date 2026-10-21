@@ -34,9 +34,13 @@ idx.THROTTLE = (
     float(os.environ.get("NETR_THROTTLE_MIN", "2.8")),
     float(os.environ.get("NETR_THROTTLE_MAX", "3.4")),
 )
-idx.RETRIES = 3
+idx.RETRIES = 0     # one POST per ask: a number NETR did not answer is asked again by the -again run, not here
 
 THROTTLE_MARKERS = ("too many searches", "please wait a moment")
+REFUSED = ("http_403", "http_429")
+# A shard stops at the first hard refusal, or at MAX_WALLED numbers still walled after their back-off (10-21 sweep:
+# 2 to 8 per 200-number shard, in pairs, all answered by the -again run). The rest are written not_asked, unsent.
+MAX_WALLED = 10
 RATE_LOCK = threading.Lock()
 NEXT_REQUEST_AT = 0.0
 
@@ -97,6 +101,7 @@ def harvest_docs(docs, out_csv, conc):
     w.writerow(["doc_no", "ok", "county_type", "record_date",
                 "grantors", "grantees", "ain", "lead_class", "reason"])
     t0 = time.time()
+    halt, walled = [], []
 
     def write_row(res):
         cls = lc.lead_class(res.get("county_type")) if res.get("ok") else ""
@@ -122,12 +127,23 @@ def harvest_docs(docs, out_csv, conc):
                 d = jobs.get_nowait()
             except queue.Empty:
                 return
+            if halt:
+                write_row({"doc_no": str(d), "ok": False, "reason": "not_asked: " + halt[0]})
+                jobs.task_done()
+                continue
             try:
                 # save_evidence False: runners are ephemeral, CSV is the product
                 res = fetch_resilient(d)
             except Exception as e:
                 res = {"doc_no": str(d), "ok": False,
                        "reason": "exc:%s" % type(e).__name__}
+            with lock:
+                if (res.get("reason") or "").startswith(REFUSED):
+                    halt.append("NETR refused %s: %s" % (d, res["reason"]))
+                elif not res.get("ok") and _is_throttled(res):
+                    walled.append(d)
+                    if len(walled) >= MAX_WALLED:
+                        halt.append("%d numbers walled, the last %s" % (len(walled), d))
             write_row(res)
             jobs.task_done()
 
@@ -137,6 +153,8 @@ def harvest_docs(docs, out_csv, conc):
     for t in ts:
         t.join()
     fh.close()
+    if halt:
+        print("SHARD STOPPED: %s" % halt[0], flush=True)
     el = time.time() - t0
     print("\nSHARD DONE %d docs in %.1f min (%.0f req/min) stats=%s" %
           (total, el / 60, total / el * 60, dict(stats)), flush=True)

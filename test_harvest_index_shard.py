@@ -52,6 +52,34 @@ class ExactRetryTests(unittest.TestCase):
         self.assertEqual(seen, [20260478123, 20260490000])
         self.assertEqual([row["doc_no"] for row in rows], [str(x) for x in seen])
 
+    def harvest(self, answer, docs=range(20260760884, 20260760904)):
+        seen = []
+
+        def fetch(doc, **_kwargs):
+            seen.append(doc)
+            return {"doc_no": str(doc), "ok": False, "reason": answer(len(seen))}
+
+        self.mod.fetch_resilient = fetch
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out.csv"
+            self.mod.harvest_docs(docs, out, conc=1)
+            with out.open(newline="", encoding="utf-8") as fh:
+                return seen, [row["reason"] for row in csv.DictReader(fh)]
+
+    def test_a_shard_stops_at_the_first_hard_refusal_and_writes_the_rest_not_asked(self):
+        seen, reasons = self.harvest(lambda n: "http_429" if n == 3 else "not_found")
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(reasons[:3], ["not_found", "not_found", "http_429"])
+        self.assertEqual(reasons[3:], ["not_asked: NETR refused 20260760886: http_429"] * 17)
+
+    def test_a_shard_stops_once_max_walled_numbers_stay_walled(self):
+        wall = "parse_no_row:Too many searches. Please wait a moment"
+        seen, reasons = self.harvest(lambda n: wall if n % 2 else "not_found")
+        self.assertEqual(len(seen), 2 * self.mod.MAX_WALLED - 1)
+        self.assertEqual(reasons.count(wall), self.mod.MAX_WALLED)
+        self.assertEqual(len(reasons), 20)
+        self.assertTrue(reasons[-1].startswith("not_asked: 10 numbers walled"))
+
     def test_http_200_soft_wall_is_retryable(self):
         self.assertTrue(self.mod._is_throttled({"reason": "parse_no_row: Too many searches. Please wait a moment"}))
         self.assertFalse(self.mod._is_throttled({"reason": "not_found"}))
