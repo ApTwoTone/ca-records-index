@@ -7,7 +7,7 @@ and k stops following the page asked), and an end answer (Worker upstream 500) o
 PNG is NETR's "no scan yet" and ends it as blank. A 200 with no page image that names no wall is that document's own
 state (no_image_200), until more than NO_IMAGE_TRIP in one shard. Nothing that answered is asked again. A 403, a 429,
 a 200 naming a Cloudflare challenge, a denial or a rate limit, or any other answer stops the whole shard, and every
-document after it is not asked. OUTDIR gets <doc>_<page>.png, status.csv (doc_no, state, pages, requests) and, for
+document after it is not asked. OUTDIR gets <doc>_<page>.png or .jpg, status.csv (doc_no, state, pages, requests) and, for
 each answer that was not a page, <doc>_<page>.body: its Content-Type and first HEAD_BYTES bytes.
 """
 import csv
@@ -27,13 +27,14 @@ WORKER = "https://netr-thumb.kaiescobar09.workers.dev"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 MAX_PAGES, MIN_PNG = 9, 5000
 NO_IMAGE_TRIP, HEAD_BYTES = 3, 2048
+JPEG = b"\xff\xd8\xff"   # NETR serves grey JPEG pages since 2026-10-21, PNG before
 WALL = re.compile(rb"cloudflare|cf[-_]ray|cf_chl|challenge|captcha|just a moment|attention required|access denied"
                   rb"|forbidden|blocked|unauthori[sz]ed|rate[ -_]?limit|too many", re.I)
 
 
 def served(png: bytes) -> int | None:
     """The TIFF page index NETR rendered this PNG from (Thumb::URI ".../<doc>.tif[k]"), or None if it doesn't say."""
-    at = 8
+    at = 8 if png[:4] == b"\x89PNG" else len(png)
     while at + 8 <= len(png):
         size, kind = struct.unpack(">I4s", png[at:at + 8])
         data = png[at + 8:at + 8 + size]
@@ -58,7 +59,7 @@ def ask(key: str, doc: str, page: int) -> tuple[str, bytes, str]:
             return "error_500", body, kind
     except OSError as e:
         return f"error_{type(e).__name__}", b"", ""
-    if body[:4] == b"\x89PNG" and len(body) >= MIN_PNG:
+    if body.startswith((b"\x89PNG", JPEG)) and len(body) >= MIN_PNG:
         return "page", body, kind
     if upstream == "500":
         return "end", body, kind
@@ -90,7 +91,7 @@ def main() -> int:
                 sha = hashlib.sha256(body).hexdigest()
                 if answer == "page" and sha not in seen and served(body) in (page - 1, None):
                     seen.add(sha)
-                    (out / f"{doc}_{page}.png").write_bytes(body)
+                    (out / f"{doc}_{page}.{'jpg' if body[:2] == JPEG[:2] else 'png'}").write_bytes(body)
                     continue
                 if answer not in ("page", "end", "blank"):
                     head = body.replace(key.encode(), b"[key]")[:HEAD_BYTES]

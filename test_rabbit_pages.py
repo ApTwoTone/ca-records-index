@@ -36,5 +36,16 @@ class WorkerFiveHundredTests(unittest.TestCase):
         self.assertEqual(self.ask(http_500()), "error_500")
 
 
+class PageImageTests(unittest.TestCase):
+    def test_a_grey_jpeg_page_is_a_page(self):
+        mod = load_module()
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.headers = {"X-Upstream-Status": "200", "Content-Type": "image/jpeg"}
+        resp.read.return_value = b"\xff\xd8\xff\xe0" + b"\0" * 6000
+        with mock.patch.object(mod.urllib.request, "urlopen", return_value=resp):
+            self.assertEqual(mod.ask("key", "20260761134", 1)[0], "page")
+
+
 if __name__ == "__main__":
     unittest.main()
