@@ -53,7 +53,9 @@ def ask(key: str, doc: str, page: int) -> tuple[str, bytes, str]:
             upstream, body = resp.headers.get("X-Upstream-Status", str(resp.status)), resp.read()
             kind = resp.headers.get("Content-Type", "")
     except urllib.error.HTTPError as e:
-        upstream, body, kind = str(e.code), e.read(), e.headers.get("Content-Type", "")
+        upstream, body, kind = e.headers.get("X-Upstream-Status", str(e.code)), e.read(), e.headers.get("Content-Type", "")
+        if "X-Upstream-Status" not in e.headers and e.code == 500:  # the Worker's own 500, not NETR's end of document
+            return "error_500", body, kind
     except OSError as e:
         return f"error_{type(e).__name__}", b"", ""
     if body[:4] == b"\x89PNG" and len(body) >= MIN_PNG:
