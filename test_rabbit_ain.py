@@ -15,9 +15,10 @@ class Resp:
         self.text, self.status_code = body if isinstance(body, str) else json.dumps(body), status
 
 
-def page(total, docs):
-    rows = "".join(f"<tr><td><a>{d}</a></td><td>2024-09-20</td><td>DEED<a>cart</a></td><td>A</td><td>B</td></tr>"
-                   for d in docs)
+def page(total, docs, names=None):
+    names = names or {}
+    rows = "".join(f"<tr><td><a>{d}</a></td><td>2024-09-20</td><td>DEED<a>cart</a></td>"
+                   f"<td>{names.get(d, ('A', 'B'))[0]}</td><td>{names.get(d, ('A', 'B'))[1]}</td></tr>" for d in docs)
     return Resp([f"{total} documents found", f"<table>{rows}</table>"])
 
 
@@ -86,18 +87,42 @@ class WalkTests(unittest.TestCase):
 
 
 class ShardTests(unittest.TestCase):
-    def run_shard(self, pairs, answers):
+    def run_shard(self, pairs, answers, salt=""):
         session = mock.Mock()
         session.post.side_effect = list(answers)
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch("rabbit_ain._pace_request"), mock.patch("rabbit_ain.time.sleep"), \
-                mock.patch("rabbit_ain.idx._session", return_value=session):
+                mock.patch("rabbit_ain.idx._session", return_value=session), \
+                mock.patch.dict("os.environ", {"NAME_SALT": salt}):
             (Path(tmp) / "pairs.txt").write_text(" ".join(pairs))
             with mock.patch("sys.argv", ["rabbit_ain.py", f"{tmp}/pairs.txt", f"{tmp}/out"]):
                 rabbit_ain.main()
-            self.assertEqual(sorted(p.name for p in (Path(tmp) / "out").iterdir()), ["status.csv"])
+            self.assertEqual(sorted(p.name for p in (Path(tmp) / "out").iterdir()), ["companions.csv", "status.csv"])
             rows = list(csv.DictReader((Path(tmp) / "out" / "status.csv").read_text().splitlines()))
+            self.companions = (Path(tmp) / "out" / "companions.csv").read_text()
         return [r["state"] for r in rows], session.post.call_count
+
+    def companion_page(self):
+        plus2, minus7 = str(int(DOC) + 2), str(int(DOC) - 7)
+        names = {plus2: ("JOHN Q SMITH", "SMITH FAMILY TRUST<br>JOHN Q SMITH"), minus7: ("JOHN Q SMITH", "X")}
+        return page(3, [minus7, plus2, DOC], names), plus2
+
+    def test_neighbours_within_5_are_reported_with_salted_name_hashes(self):
+        answer, plus2 = self.companion_page()
+        self.assertEqual(self.run_shard([f"{AIN}:{DOC}"], [answer], salt="test-salt")[0], ["proven"])
+        rows = list(csv.DictReader(self.companions.splitlines()))
+        with mock.patch.dict("os.environ", {"NAME_SALT": "test-salt"}):
+            want = rabbit_ain.token_hashes(["JOHN Q SMITH", "SMITH FAMILY TRUST"])
+        self.assertEqual(len(want), 2)  # JOHN, SMITH; Q, FAMILY, TRUST dropped
+        self.assertEqual(rows, [{"ain": AIN, "doc_no": DOC, "companion": plus2, "record_date": "2024-09-20",
+                                 "county_type": "DEED", "tokens": " ".join(want)}])
+        self.assertNotIn("SMITH", self.companions.upper())
+
+    def test_no_salt_writes_no_tokens(self):
+        answer, plus2 = self.companion_page()
+        self.run_shard([f"{AIN}:{DOC}"], [answer])
+        rows = list(csv.DictReader(self.companions.splitlines()))
+        self.assertEqual([(r["companion"], r["tokens"]) for r in rows], [(plus2, "")])
 
     def test_403_stops_the_shard(self):
         pairs = [f"{AIN}:{DOC}", f"5555000222:{DOC}", f"5555000333:{DOC}"]

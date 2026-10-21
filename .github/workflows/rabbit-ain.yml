@@ -42,6 +42,7 @@ jobs:
       - name: walk AINs for shard ${{ matrix.i }}
         env:
           PAIRS: ${{ matrix.pairs }}
+          NAME_SALT: ${{ secrets.NAME_SALT }}
         run: |
           echo "$PAIRS" > pairs.txt
           python3 rabbit_ain.py pairs.txt out

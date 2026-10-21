@@ -14,11 +14,16 @@ clock for the whole process, 2.9-3.5 s between any two POSTs. Each POST is sent 
   error_<x>         a network error, a non-200 other than 403/429, or a non-JSON answer
   http_403/http_429 NETR refused: the shard stops
   not_asked: why    the shard stopped earlier (first 403/429, or MAX_WALLED walled pairs); nothing was sent
-OUTDIR gets status.csv (ain, doc_no, state, pages, requests) and nothing else: no bodies, no names (public repo).
+OUTDIR gets status.csv (ain, doc_no, state, pages, requests) and companions.csv: every row the walk read whose doc#
+is within +/-5 of the pair's (LA's AIN index never lists an AOD; Rabbit proves it by a same-day companion recording
+that shares a person). Names leave only as salted hashes (token_hashes, salt NAME_SALT); with no salt, no tokens.
+No bodies, no clear names (public repo).
 """
 import csv
 import datetime
+import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -31,10 +36,24 @@ ROWS, MAX_PAGES, MAX_WALLED, WALL_RETRIES = 10, 40, 3, 3
 PAIR = re.compile(r"(\d{10}):(2\d{10})")
 HEADERS = {"Referer": idx.FORM_URL, "Origin": idx.BASE, "X-Requested-With": "XMLHttpRequest",
            "Accept": "application/json, text/javascript, */*; q=0.01"}
+NEAR = 5
+STOP = {"TRUST", "TRUSTEE", "TRUSTEES", "TR", "LLC", "INC", "CORP", "CORPORATION", "COMPANY", "CO", "BANK", "NA",
+        "THE", "OF", "AND", "ESTATE", "DECEASED", "DEC", "LIVING", "REVOCABLE", "FAMILY", "JR", "SR", "II", "III",
+        "AKA", "FKA", "ET", "AL"}
 
 
-def ask(session, ain: str, page: int) -> tuple[str, int | None, list[str]]:
-    """(answer, stated total, doc numbers on this page); answer is rows, no_docs, wall, http_403/429 or error_<x>."""
+def token_hashes(names: list[str]) -> list[str]:
+    """Sorted unique salted hashes of the name tokens; [] without NAME_SALT, so a clear name never leaves."""
+    salt = os.environ.get("NAME_SALT", "")
+    if not salt:
+        return []
+    tokens = {t for n in names for t in re.findall(r"[A-Z]{2,}", n.upper())} - STOP
+    return sorted({hashlib.sha256((salt + ":" + t).encode()).hexdigest()[:16] for t in tokens})
+
+
+def ask(session, ain: str, page: int) -> tuple[str, int | None, list[tuple]]:
+    """(answer, stated total, rows on this page as (doc#, date, type, names)); answer is rows, no_docs, wall,
+    http_403/429 or error_<x>."""
     data = {"page": str(page), "g-recaptcha-response": "", "beg_dt": idx.EARLIEST,
             "end_dt": datetime.date.today().isoformat(), "company": "", "first_name": "", "last_name": "",
             "signer": "R", "ain": ain, "doc_no": ""}
@@ -57,19 +76,21 @@ def ask(session, ain: str, page: int) -> tuple[str, int | None, list[str]]:
     if "no documents" in count:
         return "no_docs", 0, []
     total = re.search(r"(\d[\d,]*) documents?", count)
-    docs = [re.sub(r"\D", "", idx._clean(cells[0])) for m in idx._ROW_RE.finditer(results)
-            if len(cells := idx._CELL_RE.findall(m[1])) >= 5]
-    return "rows", int(total[1].replace(",", "")) if total else None, docs
+    rows = [(re.sub(r"\D", "", idx._clean(cells[0])), date[0] if (date := idx._DATE_RE.search(idx._clean(cells[1])))
+             else "", idx._clean(re.split(r"<a\b", cells[2], flags=re.I)[0]),
+             idx._split_names(cells[3]) + idx._split_names(cells[4]))
+            for m in idx._ROW_RE.finditer(results) if len(cells := idx._CELL_RE.findall(m[1])) >= 5]
+    return "rows", int(total[1].replace(",", "")) if total else None, rows
 
 
-def walk(session, ain: str, doc: str) -> tuple[str, int, int]:
-    """(state, pages read, requests) for one pair."""
-    seen, total, asked = set(), None, 0
+def walk(session, ain: str, doc: str, near: dict | None = None) -> tuple[str, int, int]:
+    """(state, pages read, requests) for one pair; rows within +/-NEAR of doc land in near, keyed by doc#."""
+    seen, total, asked, near = set(), None, 0, {} if near is None else near
     for page in range(1, MAX_PAGES + 1):
         for attempt in range(WALL_RETRIES + 1):
             if attempt:
                 time.sleep(6 + 4 * (attempt - 1))
-            answer, count, docs = ask(session, ain, page)
+            answer, count, rows = ask(session, ain, page)
             asked += 1
             if answer != "wall":
                 break
@@ -84,6 +105,8 @@ def walk(session, ain: str, doc: str) -> tuple[str, int, int]:
         if total is not None and count != total:
             return f"incomplete: the total changed from {total} to {count} on page {page}", page, asked
         total = count
+        docs = [r[0] for r in rows]
+        near.update((r[0], r) for r in rows if r[0] != doc and r[0].isdigit() and abs(int(r[0]) - int(doc)) <= NEAR)
         if doc in docs:
             return "proven", page, asked
         if not set(docs) - seen:
@@ -103,20 +126,25 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     session = idx._session()
     stopped, walled = None, 0
-    with (out / "status.csv").open("w", newline="") as fh:
-        w = csv.writer(fh)
+    with (out / "status.csv").open("w", newline="") as fh, (out / "companions.csv").open("w", newline="") as ch:
+        w, c = csv.writer(fh), csv.writer(ch)
         w.writerow(["ain", "doc_no", "state", "pages", "requests"])
+        c.writerow(["ain", "doc_no", "companion", "record_date", "county_type", "tokens"])
         for ain, doc in (PAIR.fullmatch(p).groups() for p in dict.fromkeys(words)):
             if stopped:
                 w.writerow([ain, doc, f"not_asked: {stopped}", 0, 0])
                 continue
-            state, pages, asked = walk(session, ain, doc)
+            near = {}
+            state, pages, asked = walk(session, ain, doc, near)
             if state in ("http_403", "http_429"):
                 stopped = f"{state} on {ain}:{doc}"
             elif state == "walled" and (walled := walled + 1) >= MAX_WALLED:
                 stopped = f"{walled} pairs walled, the last {ain}:{doc}"
             w.writerow([ain, doc, state, pages, asked])
+            c.writerows([ain, doc, comp, date, ctype, " ".join(token_hashes(names))]
+                        for comp, date, ctype, names in near.values())
             fh.flush()
+            ch.flush()
             print(ain, doc, state, pages, asked, flush=True)
     return 0
 
