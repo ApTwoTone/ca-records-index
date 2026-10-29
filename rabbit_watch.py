@@ -4,7 +4,8 @@
 GET /losangeles once for its "Database current to" date, then POST /lasearch once per number, no retry
 (la_county_index.fetch with RETRIES 0). A wall or an answer that is neither a row nor "no documents" stops the look
 there: a network error is "error" (the Spark counts it as a failed look), any other answer is "wall" (the Spark
-stops). Prints JSON: banner, status, wall, error, docs (doc_no, ok, county_type, record_date, reason), requests.
+stops). So is a search form whose fields are not the ones la_county_index.fetch posts (Kai 10-28). Prints JSON:
+banner, status, wall, error, docs (doc_no, ok, county_type, record_date, reason), requests.
 """
 import json
 import re
@@ -14,6 +15,19 @@ import la_county_index as idx
 
 WALLS = ("too many searches", "please wait a moment", "unusual activity", "unusual traffic", "access denied",
          "you have been blocked")
+# The fields of /losangeles's #la_search form, the ones la_county_index.fetch posts to /lasearch.
+FORM = {"ain", "beg_dt", "company", "doc_no", "end_dt", "first_name", "g-recaptcha-response", "last_name", "page", "signer"}
+
+
+def form_change(text: str) -> str | None:
+    """How NETR's LA search form differs from FORM, or None when it is the same."""
+    if not (form := re.search(r'<form\b[^>]*\bid="la_search".*?</form>', text, re.S | re.I)):
+        return "search form changed: no #la_search form"
+    names = set(re.findall(r'<(?:input|select|textarea)\b[^>]*\bname="([^"]+)"', form[0], re.I))
+    if names == FORM:
+        return None
+    gone, new = " ".join(sorted(FORM - names)), " ".join(sorted(names - FORM))
+    return "search form changed:" + (f" gone {gone}" if gone else "") + (f" new {new}" if new else "")
 
 
 def look(docs: list[str]) -> dict:
@@ -29,6 +43,9 @@ def look(docs: list[str]) -> dict:
         out["banner"] = m[1]
     if page.status_code != 200 or any(w in text.lower() for w in WALLS):
         out["wall"] = f"/losangeles: http {page.status_code}"
+        return out
+    if changed := form_change(text):
+        out["wall"] = f"/losangeles: {changed}"
         return out
     idx._SESSION, idx.RETRIES = session, 0
     for doc in docs:
