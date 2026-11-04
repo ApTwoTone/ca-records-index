@@ -3,8 +3,9 @@
 
 Each page is asked once, through the NETR Worker, 5-7 s apart. A document stops at its first page that isn't a page:
 past the last page NETR serves the last page again (its PNG's Thumb::URI names the TIFF page it came from, ".tif[k]",
-and k stops following the page asked), and an end answer (Worker upstream 500) or a byte repeat ends it too; a 0-byte
-PNG is NETR's "no scan yet" and ends it as blank. A 200 with no page image that names no wall is that document's own
+and k stops following the page asked), and an end answer (Worker upstream 500, or an empty 403 after a saved page:
+NETR's answer past the last page since 2026-11-04) or a byte repeat ends it too; a 0-byte PNG is NETR's "no scan yet"
+and ends it as blank. A 200 with no page image that names no wall is that document's own
 state (no_image_200), until more than NO_IMAGE_TRIP in one shard. Nothing that answered is asked again. A 403, a 429,
 a 200 naming a Cloudflare challenge, a denial or a rate limit, or any other answer stops the whole shard, and every
 document after it is not asked. A page is known by its bytes: PNG, JPEG, WebP, GIF, TIFF or PDF. OUTDIR gets
@@ -111,6 +112,8 @@ def main() -> int:
                     seen.add(sha)
                     (out / f"{doc}_{page}.{extension(body)}").write_bytes(body)
                     continue
+                if answer == "http_403" and not body and seen:
+                    answer = "end"
                 if answer not in ("page", "end", "blank"):
                     head = body.replace(key.encode(), b"[key]")[:HEAD_BYTES]
                     (out / f"{doc}_{page}.body").write_bytes(f"Content-Type: {kind}\n\n".encode() + head)
