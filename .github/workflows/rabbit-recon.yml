@@ -1,0 +1,39 @@
+name: rabbit-recon
+# One-off read-only NETR recon for Rabbit (2026-11-04); not used by the watcher. The steps are in rabbit_recon.py.
+on:
+  workflow_dispatch:
+    inputs:
+      plan_b64: { required: true, type: string }
+      pubkey_b64: { required: true, type: string }
+
+permissions:
+  contents: read
+
+jobs:
+  look:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install --quiet curl_cffi
+      - name: recon
+        env:
+          NETR_PROXY_KEY: ${{ secrets.NETR_PROXY_KEY }}
+          PLAN_B64: ${{ inputs.plan_b64 }}
+          PUB_B64: ${{ inputs.pubkey_b64 }}
+        run: |
+          echo "$PLAN_B64" | base64 -d > plan.json
+          echo "$PUB_B64" | base64 -d > pub.pem
+          python3 rabbit_recon.py plan.json out
+          mkdir enc
+          K=$(openssl rand -hex 32)
+          tar czf out.tgz out
+          openssl enc -aes-256-cbc -pbkdf2 -pass "pass:$K" -in out.tgz -out enc/out.tgz.enc
+          printf %s "$K" | openssl pkeyutl -encrypt -pubin -inkey pub.pem -out enc/key.enc
+          rm -rf out out.tgz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rabbit-recon
+          path: enc/
+          retention-days: 1
